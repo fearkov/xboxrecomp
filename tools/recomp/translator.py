@@ -23,7 +23,7 @@ from .config import va_to_file_offset, is_code_address
 from . import config as _config
 from .disasm import Disassembler
 from .lifter import (Lifter, lift_basic_block, detect_seh_helpers,
-                     detect_setjmp_helpers, _func_ident)
+                     detect_setjmp_helpers, _func_ident, _operand_width)
 
 
 def write_if_changed(path, text):
@@ -196,6 +196,20 @@ def xbe_title(xbe_data, xbe_path):
         pass
     return os.path.splitext(os.path.basename(xbe_path))[0]
 
+
+
+def _seh_prologs_of(lifter):
+    """Every __SEH_prolog address a lifter knows about, as a set.
+
+    Reads SEH_PROLOGS when present and falls back to the scalar SEH_PROLOG,
+    so a lifter stub that only sets the old attribute still works -- the test
+    suite builds exactly such a stub, and so may callers outside this repo.
+    """
+    prologs = getattr(lifter, "SEH_PROLOGS", None)
+    if prologs:
+        return set(prologs)
+    one = getattr(lifter, "SEH_PROLOG", None)
+    return {one} if one is not None else set()
 
 class FunctionTranslator:
     """Translates individual x86 functions to C source code."""
@@ -604,10 +618,10 @@ class FunctionTranslator:
         """
         if self._func_has_prologue(instructions):
             return True
-        seh_prolog = getattr(self.lifter, "SEH_PROLOG", None)
-        if seh_prolog is None:
+        seh_prologs = _seh_prologs_of(self.lifter)
+        if not seh_prologs:
             return False
-        return any(getattr(insn, "call_target", None) == seh_prolog
+        return any(getattr(insn, "call_target", None) in seh_prologs
                    for insn in instructions)
 
     def translate_function(self, func_addr, func_info):
@@ -763,8 +777,10 @@ class FunctionTranslator:
         # hardcoded to one game's CRT here, so for every other title the forcing
         # silently never fired and the generated C failed to compile with
         # "'ebp': undeclared identifier".
-        seh_funcs = {a for a in (self.lifter.SEH_PROLOG, self.lifter.SEH_EPILOG)
-                     if a is not None}
+        seh_funcs = _seh_prologs_of(self.lifter)
+        epilog = getattr(self.lifter, "SEH_EPILOG", None)
+        if epilog is not None:
+            seh_funcs = seh_funcs | {epilog}
         if seh_funcs and any(insn.call_target in seh_funcs
                              for insn in instructions):
             used_regs.add("ebp")
@@ -973,6 +989,45 @@ class FunctionTranslator:
             if not leaves and i + 1 < len(blocks):
                 preds[blocks[i + 1].start].add(bb.start)
 
+        # Settle the flag state before emitting anything.
+        #
+        # Blocks are walked in address order, so the predecessor on a back
+        # edge sits *after* the block it reaches and has no out-state yet on
+        # the first pass. The join below then sees an unknown predecessor and
+        # gives up, which is safe but costly: the jcc at the top of a loop is
+        # exactly that shape, and it lifts to the never-taken `_flags`
+        # fallback. One such loop in Shin Megami Tensei: Nine had its exit
+        # test compiled away and wrote eight bytes per iteration until it
+        # walked out of mapped memory.
+        #
+        # Iterating to a fixed point fixes it. A block's out-state depends on
+        # its own instructions unless it has no flag setter at all, in which
+        # case it passes its incoming through -- so the pass converges, and
+        # three rounds is far more than any real loop nest needs. Lines are
+        # discarded here; only the out-states are kept.
+        out_state = {}
+        saved_unimplemented = {
+            k: list(v) for k, v in self.lifter.unimplemented.items()
+        }
+        for _ in range(3):
+            changed = False
+            for bb in blocks:
+                incoming = _incoming_flag_state(preds[bb.start], out_state,
+                                                bb.start == start)
+                _, new_out = lift_basic_block(
+                    self.lifter, bb, flag_state=incoming)
+                if out_state.get(bb.start) != new_out:
+                    out_state[bb.start] = new_out
+                    changed = True
+            if not changed:
+                break
+        # The probe passes recorded their unimplemented instructions too, and
+        # those counts are a report about the title, not about how many times
+        # the lifter ran.
+        self.lifter.unimplemented.clear()
+        self.lifter.unimplemented.update(saved_unimplemented)
+
+        settled_state = dict(out_state)
         out_state = {}
         for bb in blocks:
             # Emit label if this block is a branch target
@@ -988,18 +1043,8 @@ class FunctionTranslator:
             # Blocks are walked in address order, so a back edge's predecessor
             # may not be computed yet -- treat that as unknown rather than
             # guessing, which costs a fallback condition and never a wrong one.
-            sources = preds[bb.start]
-            if bb.start == start or not sources:
-                incoming = None
-            elif all(p in out_state for p in sources):
-                states = [out_state[p] for p in sources]
-                incoming = states[0]
-                for other in states[1:]:
-                    if other != incoming:
-                        incoming = None
-                        break
-            else:
-                incoming = None
+            incoming = _incoming_flag_state(preds[bb.start], settled_state,
+                                            bb.start == start)
 
             stmts, out_state[bb.start] = lift_basic_block(
                 self.lifter, bb, flag_state=incoming)
@@ -1103,6 +1148,75 @@ class FunctionTranslator:
         return regs
 
 
+
+def _merge_flag_states(states):
+    """Merge comparable snapshots without requiring identical source operands.
+
+    CMP/TEST save their operands into function-local _fa/_fb/_fas/_fbs at
+    runtime. A shared consumer can use whichever predecessor executed. Keep
+    operation and width equal because sign/parity handling depends on them;
+    arithmetic states still reconstruct operands and cannot use this merge.
+    """
+    if not states or any(not state or not state[0] for state in states):
+        return None
+    first = states[0]
+    if all(state == first for state in states[1:]):
+        return first
+    if first[0] in ("cmp", "test") and len(first[1]) == 2:
+        width = _operand_width(first[1][0]) or _operand_width(first[1][1])
+        for kind, ops in states[1:]:
+            if kind != first[0] or len(ops) != 2:
+                return None
+            if (_operand_width(ops[0]) or _operand_width(ops[1])) != width:
+                return None
+        return first
+    return _merge_zero_flag(states)
+
+
+def _merge_zero_flag(states):
+    """Predecessors that disagree on the operation but not on the zero flag.
+
+    `sub eax, ecx` reaching a loop head by fall-through and `dec eax` reaching
+    it by the back edge are different setters, so the state cannot be
+    inherited as itself -- yet both leave ZF as (eax == 0), which is the whole
+    of what a je or jne there is asking. Unlike the CMP/TEST merge above,
+    these reconstruct their operands rather than reading a snapshot, so the
+    merge only survives when every predecessor names the same destination
+    register; the name carries the width, so `dec al` and `sub eax, ecx` do
+    not merge.
+
+    The marker is deliberately narrow: only ZF is answerable from it. `dec`
+    does not write CF, so a jb after the same join would be reading a flag one
+    predecessor never set, and _make_condition refuses it.
+    """
+    from .lifter import ZF_FROM_DEST
+    dests = set()
+    for setter, ops in states:
+        if setter not in ZF_FROM_DEST or not ops:
+            return None
+        op = ops[0]
+        # disasm.Operand, not a capstone operand: .type is the string "reg".
+        if getattr(op, "type", None) != "reg" or not op.reg:
+            return None
+        dests.add(op.reg)
+    if len(dests) != 1:
+        return None
+    return ("__zf_from_dest", [states[0][1][0]])
+
+
+def _incoming_flag_state(sources, known, is_entry):
+    """The flag state a block inherits, or None when it cannot be known.
+
+    A predecessor with no computed state yet makes the result unknown rather
+    than guessed: that costs a fallback condition and never a wrong one.
+    """
+    if is_entry or not sources:
+        return None
+    if not all(p in known for p in sources):
+        return None
+    return _merge_flag_states([known[p] for p in sources])
+
+
 class BatchTranslator:
     """Translates multiple functions and writes C source files."""
 
@@ -1162,9 +1276,9 @@ class BatchTranslator:
         # Detect the SEH helpers once here rather than per-Lifter, so the
         # result can be reported and overridden from the command line.
         if seh_prolog is None or seh_epilog is None:
-            found_prolog, found_epilog = detect_seh_helpers(
+            found_prologs, found_epilog = detect_seh_helpers(
                 self.func_db, self.xbe_data, verbose=True)
-            seh_prolog = seh_prolog if seh_prolog is not None else found_prolog
+            seh_prolog = seh_prolog if seh_prolog is not None else found_prologs
             seh_epilog = seh_epilog if seh_epilog is not None else found_epilog
         self.seh_prolog = seh_prolog
         self.seh_epilog = seh_epilog

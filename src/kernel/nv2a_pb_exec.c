@@ -165,6 +165,10 @@ static int surface_write_refused(uint32_t base, uint32_t bytes, const char *what
 #define NV097_FLIP_INCREMENT_WRITE        0x012C
 #define NV097_FLIP_STALL                  0x0130
 #define NV097_ARRAY_ELEMENT16             0x1800
+/* Draw a run of vertices straight out of the arrays, with no index list:
+ * bits 0..23 are the first vertex, bits 24..31 the count minus one. It may
+ * appear several times inside one BEGIN_END to draw a longer run. */
+#define NV097_DRAW_ARRAYS                 0x1810
 #define NV097_INLINE_ARRAY                0x1818
 /* Immediate-mode vertices. SET_VERTEX3F/4F carry the position, and writing
  * its last component completes a vertex using whatever the SET_VERTEX_DATA*
@@ -244,6 +248,9 @@ static struct {
     uint32_t clip_x, clip_w, clip_y, clip_h;
     uint32_t clear_color;
     uint32_t clears, unhandled_total;
+    /* NV097_SET_TRANSFORM_EXECUTION_MODE (0x1E94): bits 0-1 pick the path,
+     * 0 fixed function and 2 the vertex program. */
+    uint32_t xform_mode;
     uint32_t flip_read, flip_write, flip_modulo, flips;
     uint32_t tris_drawn, tris_skipped_offscreen, batches_untransformed;
     /* Why a batch came out flat. "Untextured" has two causes that look
@@ -593,7 +600,11 @@ static void clear_surface(uint32_t param)
      * would show the one nothing is writing. */
     /* The window has to read where the pixels actually are, which is the
      * resolved address rather than the DMA-object offset. */
-    xbox_FramebufferWindowSet(dma_resolve(s_gpu.color_offset), s_gpu.pitch);
+    /* Only until the title flips: following the draw surface every scan
+     * shows the buffer being written right now, half a frame at a time. Past
+     * the first flip the window is repointed there instead. */
+    if (s_gpu.flips == 0)
+        xbox_FramebufferWindowSet(dma_resolve(s_gpu.color_offset), s_gpu.pitch);
 
     /* And open the window, rather than waiting for AvSetDisplayMode to do it.
      *
@@ -909,6 +920,218 @@ static void put_pixel(uint8_t *mem, uint32_t bpp, int x, int y, uint32_t argb)
     }
 }
 
+/* ---- The NV2A vertex program ------------------------------------------
+ *
+ * Shin Megami Tensei: Nine submits every one of its draws through the
+ * programmable transform path -- measured, 28686 of 28686 batches report
+ * SET_TRANSFORM_EXECUTION_MODE mode 2, and it never uploads a fixed-function
+ * matrix. The vertices in its arrays are therefore model space, and the
+ * position each draw actually wants is built by the program from constants
+ * the title rewrites before every draw. Using the array positions directly
+ * put every glyph of a keyboard at one place.
+ *
+ * The encoding below is taken from xemu's field table
+ * (hw/xbox/nv2a/pgraph/glsl/vsh-prog.c) rather than recalled: an instruction
+ * is four little-endian dwords, dword 0 unused, and every field is a
+ * (dword, start bit, width) triple.
+ */
+#define VP_MAX_SLOTS   136
+#define VP_MAX_CONSTS   192
+
+typedef struct { uint8_t dw, bit, len; } VpField;
+
+/* Order matches VpFieldName below. */
+static const VpField VP_FIELDS[] = {
+    {1, 25, 3}, {1, 21, 4}, {1, 13, 8}, {1,  9, 4},     /* ILU MAC CONST V  */
+    {1,  8, 1}, {1,  6, 2}, {1,  4, 2}, {1,  2, 2},     /* A neg, swz x y z */
+    {1,  0, 2}, {2, 28, 4}, {2, 26, 2},                 /* A swz w, reg, mux*/
+    {2, 25, 1}, {2, 23, 2}, {2, 21, 2}, {2, 19, 2},     /* B neg, swz x y z */
+    {2, 17, 2}, {2, 13, 4}, {2, 11, 2},                 /* B swz w, reg, mux*/
+    {2, 10, 1}, {2,  8, 2}, {2,  6, 2}, {2,  4, 2},     /* C neg, swz x y z */
+    {2,  2, 2}, {2,  0, 2}, {3, 30, 2}, {3, 28, 2},     /* C swz w, hi,lo,mux*/
+    {3, 24, 4}, {3, 20, 4}, {3, 16, 4}, {3, 12, 4},     /* out mac mask, R, ilu mask, o mask */
+    {3, 11, 1}, {3,  3, 8}, {3,  2, 1}, {3,  1, 1},     /* orb, address, mux, a0x */
+    {3,  0, 1},                                         /* final            */
+};
+
+enum VpFieldName {
+    VP_ILU, VP_MAC, VP_CONST, VP_V,
+    VP_A_NEG, VP_A_SWZ_X, VP_A_SWZ_Y, VP_A_SWZ_Z, VP_A_SWZ_W, VP_A_R, VP_A_MUX,
+    VP_B_NEG, VP_B_SWZ_X, VP_B_SWZ_Y, VP_B_SWZ_Z, VP_B_SWZ_W, VP_B_R, VP_B_MUX,
+    VP_C_NEG, VP_C_SWZ_X, VP_C_SWZ_Y, VP_C_SWZ_Z, VP_C_SWZ_W,
+    VP_C_R_HIGH, VP_C_R_LOW, VP_C_MUX,
+    VP_OUT_MAC_MASK, VP_OUT_R, VP_OUT_ILU_MASK, VP_OUT_O_MASK,
+    VP_OUT_ORB, VP_OUT_ADDRESS, VP_OUT_MUX, VP_A0X, VP_FINAL
+};
+
+/* PARAM_R = 1, PARAM_V = 2, PARAM_C = 3; OMUX_MAC = 0, OMUX_ILU = 1. */
+#define VP_PARAM_R 1u
+#define VP_PARAM_V 2u
+#define VP_PARAM_C 3u
+
+static uint32_t s_vp_prog[VP_MAX_SLOTS][4];
+static uint32_t s_vp_prog_len;
+static float    s_vp_const[VP_MAX_CONSTS][4];
+static uint32_t s_vp_prog_load, s_vp_prog_dw;
+static uint32_t s_vp_const_load, s_vp_const_dw;
+static float    s_vp_viewport_off[4], s_vp_viewport_scale[4];
+static int      s_vp_have_viewport;
+static int      s_vp_on = -1;   /* RECOMP_NO_VP turns it off */
+
+static uint32_t vp_field(const uint32_t *t, enum VpFieldName f)
+{
+    const VpField *m = &VP_FIELDS[f];
+    return (t[m->dw] >> m->bit) & ~(0xFFFFFFFFu << m->len);
+}
+
+static void vp_load_program_word(uint32_t param)
+{
+    uint32_t slot = s_vp_prog_load + s_vp_prog_dw / 4u;
+
+    if (slot < VP_MAX_SLOTS) {
+        s_vp_prog[slot][s_vp_prog_dw % 4u] = param;
+        if (slot + 1u > s_vp_prog_len)
+            s_vp_prog_len = slot + 1u;
+    }
+    s_vp_prog_dw++;
+}
+
+static void vp_load_constant_word(uint32_t param)
+{
+    uint32_t idx = s_vp_const_load + s_vp_const_dw / 4u;
+
+    if (idx < VP_MAX_CONSTS)
+        memcpy(&s_vp_const[idx][s_vp_const_dw % 4u], &param, 4);
+    s_vp_const_dw++;
+}
+
+/* One source operand: pick the register file, swizzle, negate. */
+static void vp_read_src(const uint32_t *t, int which,
+                        const float v[16][4], const float r[16][4],
+                        float out[4])
+{
+    static const enum VpFieldName neg[3] = { VP_A_NEG, VP_B_NEG, VP_C_NEG };
+    static const enum VpFieldName swz[3][4] = {
+        { VP_A_SWZ_X, VP_A_SWZ_Y, VP_A_SWZ_Z, VP_A_SWZ_W },
+        { VP_B_SWZ_X, VP_B_SWZ_Y, VP_B_SWZ_Z, VP_B_SWZ_W },
+        { VP_C_SWZ_X, VP_C_SWZ_Y, VP_C_SWZ_Z, VP_C_SWZ_W },
+    };
+    static const enum VpFieldName mux[3] = { VP_A_MUX, VP_B_MUX, VP_C_MUX };
+    const float *src;
+    float tmp[4];
+    uint32_t m = vp_field(t, mux[which]), reg, i;
+
+    if (which == 2)
+        reg = (vp_field(t, VP_C_R_HIGH) << 2) | vp_field(t, VP_C_R_LOW);
+    else
+        reg = vp_field(t, which == 0 ? VP_A_R : VP_B_R);
+
+    if (m == VP_PARAM_V) {
+        src = v[vp_field(t, VP_V) & 15u];
+    } else if (m == VP_PARAM_C) {
+        uint32_t c = vp_field(t, VP_CONST);
+        src = (c < VP_MAX_CONSTS) ? s_vp_const[c] : s_vp_const[0];
+    } else {
+        src = r[reg & 15u];
+    }
+
+    for (i = 0; i < 4; i++)
+        tmp[i] = src[vp_field(t, swz[which][i]) & 3u];
+    if (vp_field(t, neg[which]))
+        for (i = 0; i < 4; i++)
+            tmp[i] = -tmp[i];
+    memcpy(out, tmp, sizeof tmp);
+}
+
+static void vp_write_masked(float dst[4], const float src[4], uint32_t mask)
+{
+    /* The mask runs x,y,z,w from the high bit down. */
+    if (mask & 8u) dst[0] = src[0];
+    if (mask & 4u) dst[1] = src[1];
+    if (mask & 2u) dst[2] = src[2];
+    if (mask & 1u) dst[3] = src[3];
+}
+
+/* Run the uploaded program over one vertex, returning oPos. */
+static void vp_execute(const float v[16][4], float opos[4])
+{
+    float r[16][4], o[16][4];
+    uint32_t slot;
+
+    memset(r, 0, sizeof r);
+    memset(o, 0, sizeof o);
+    o[0][3] = 1.0f;
+
+    for (slot = 0; slot < s_vp_prog_len && slot < VP_MAX_SLOTS; slot++) {
+        const uint32_t *t = s_vp_prog[slot];
+        uint32_t mac = vp_field(t, VP_MAC), ilu = vp_field(t, VP_ILU);
+        float a[4], b[4], c[4], mres[4] = {0,0,0,0}, ires[4] = {0,0,0,0};
+        uint32_t out_r = vp_field(t, VP_OUT_R);
+        uint32_t i;
+
+        vp_read_src(t, 0, v, r, a);
+        vp_read_src(t, 1, v, r, b);
+        vp_read_src(t, 2, v, r, c);
+
+        switch (mac) {
+        case 1: memcpy(mres, a, sizeof mres); break;                /* MOV */
+        case 2: for (i=0;i<4;i++) mres[i] = a[i]*b[i]; break;       /* MUL */
+        case 3: for (i=0;i<4;i++) mres[i] = a[i]+c[i]; break;       /* ADD */
+        case 4: for (i=0;i<4;i++) mres[i] = a[i]*b[i]+c[i]; break;  /* MAD */
+        case 5: { float d = a[0]*b[0]+a[1]*b[1]+a[2]*b[2];          /* DP3 */
+                  for (i=0;i<4;i++) mres[i] = d; } break;
+        case 6: { float d = a[0]*b[0]+a[1]*b[1]+a[2]*b[2]+b[3];     /* DPH */
+                  for (i=0;i<4;i++) mres[i] = d; } break;
+        case 7: { float d = a[0]*b[0]+a[1]*b[1]+a[2]*b[2]+a[3]*b[3];/* DP4 */
+                  for (i=0;i<4;i++) mres[i] = d; } break;
+        case 8: mres[0]=1.0f; mres[1]=a[1]*b[1];                    /* DST */
+                mres[2]=a[2]; mres[3]=b[3]; break;
+        case 9: for (i=0;i<4;i++) mres[i] = a[i]<b[i]?a[i]:b[i]; break; /* MIN */
+        case 10:for (i=0;i<4;i++) mres[i] = a[i]>b[i]?a[i]:b[i]; break; /* MAX */
+        case 11:for (i=0;i<4;i++) mres[i] = a[i]<b[i]?1.0f:0.0f; break; /* SLT */
+        case 12:for (i=0;i<4;i++) mres[i] = a[i]>=b[i]?1.0f:0.0f; break;/* SGE */
+        default: break;                                              /* NOP, ARL */
+        }
+
+        switch (ilu) {
+        case 1: memcpy(ires, c, sizeof ires); break;                 /* MOV */
+        case 2: { float d = c[0] != 0.0f ? 1.0f/c[0] : 0.0f;         /* RCP */
+                  for (i=0;i<4;i++) ires[i] = d; } break;
+        case 3: { float d = c[0] != 0.0f ? 1.0f/c[0] : 0.0f;         /* RCC */
+                  for (i=0;i<4;i++) ires[i] = d; } break;
+        case 4: { float m2 = c[0] < 0.0f ? -c[0] : c[0];             /* RSQ */
+                  float d = m2 > 0.0f ? 1.0f/sqrtf(m2) : 0.0f;
+                  for (i=0;i<4;i++) ires[i] = d; } break;
+        case 5: { float d = powf(2.0f, c[0]);                        /* EXP */
+                  for (i=0;i<4;i++) ires[i] = d; } break;
+        case 6: { float d = c[0] > 0.0f ? logf(c[0])/logf(2.0f) : 0.0f; /* LOG */
+                  for (i=0;i<4;i++) ires[i] = d; } break;
+        default: break;                                              /* NOP, LIT */
+        }
+
+        /* MAC to its temporary, ILU to its own -- a paired ILU writes R1. */
+        if (mac) vp_write_masked(r[out_r & 15u], mres,
+                                 vp_field(t, VP_OUT_MAC_MASK));
+        if (ilu) vp_write_masked(r[mac ? 1u : (out_r & 15u)], ires,
+                                 vp_field(t, VP_OUT_ILU_MASK));
+
+        /* And whichever of the two the instruction routes to an output.
+         * OUTPUT_C is 0 and OUTPUT_O is 1, so the output-register bank is the
+         * set bit; writes to the constant bank are rare and not emulated. */
+        if (vp_field(t, VP_OUT_ORB)) {
+            uint32_t addr = vp_field(t, VP_OUT_ADDRESS) & 15u;
+            uint32_t omask = vp_field(t, VP_OUT_O_MASK);
+            if (omask)
+                vp_write_masked(o[addr],
+                                vp_field(t, VP_OUT_MUX) ? ires : mres, omask);
+        }
+
+        if (vp_field(t, VP_FINAL))
+            break;
+    }
+    memcpy(opos, o[0], sizeof o[0]);
+}
+
 /* Half-space fill. Barycentric edge functions rather than scanline slopes:
  * the same test decides both windings, so a title that emits clockwise
  * triangles does not silently render nothing. */
@@ -1159,6 +1382,55 @@ static void raster_indexed(uint32_t i0, uint32_t i1, uint32_t i2, uint32_t argb)
      || !fetch_attr(&s_gpu.attr[0], i1, p[1])
      || !fetch_attr(&s_gpu.attr[0], i2, p[2]))
         return;
+
+    /* Run the title's own vertex program when it asked for one.
+     *
+     * Without this the array positions are used as if they were screen
+     * space, which for the programmable path they are not: the position each
+     * draw wants is built by the program from constants the title rewrites
+     * between draws. Shin Megami Tensei: Nine submits every one of its draws
+     * that way and reuses one small vertex buffer, so ignoring the program
+     * put twenty-three consecutive glyph batches in one 18x18 rectangle. */
+    if (s_vp_on < 0)
+        s_vp_on = getenv("RECOMP_NO_VP") == NULL;
+    if (s_vp_on && (s_gpu.xform_mode & 3u) == 2u && s_vp_prog_len) {
+        uint32_t idx[3] = { i0, i1, i2 }, k;
+
+        for (k = 0; k < 3; k++) {
+            float v[16][4], opos[4];
+            uint32_t a;
+
+            memset(v, 0, sizeof v);
+            for (a = 0; a < NV_VERTEX_ATTRS && a < 16; a++) {
+                v[a][3] = 1.0f;
+                fetch_attr(&s_gpu.attr[a], idx[k], v[a]);
+            }
+            vp_execute((const float (*)[4])v, opos);
+            if (opos[3] != 0.0f) {
+                opos[0] /= opos[3];
+                opos[1] /= opos[3];
+            }
+            /* Straight through, no viewport transform.
+             *
+             * Measured on the title above, the program is a pass-through
+             * with half a pixel of offset: (0,0) comes out (0.531,0.531) and
+             * (640,480) comes out (640.531,480.531). Those are already
+             * surface pixels, so applying the programmed viewport (offset
+             * 320.5,240.5 scale 320,-240) on top sends a full-screen quad to
+             * 205290 and every triangle falls off the surface.
+             * RECOMP_VP_VIEWPORT restores it for a program that really does
+             * emit clip space. */
+            if (s_vp_have_viewport == 3 && getenv("RECOMP_VP_VIEWPORT")) {
+                p[k][0] = opos[0] * s_vp_viewport_scale[0]
+                        + s_vp_viewport_off[0];
+                p[k][1] = opos[1] * s_vp_viewport_scale[1]
+                        + s_vp_viewport_off[1];
+            } else {
+                p[k][0] = opos[0];
+                p[k][1] = opos[1];
+            }
+        }
+    }
 
     textured = fetch_texcoord(i0, uv[0])
             && fetch_texcoord(i1, uv[1])
@@ -1620,6 +1892,26 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
             s_gpu.inline_buf[s_gpu.inline_count++] = param;
         break;
 
+    case NV097_DRAW_ARRAYS: {
+        /* The method this title actually draws with, and the reason the
+         * executor reported zero draws while geometry was being submitted the
+         * whole time: BEGIN_END arrived, END arrived, and in between came a
+         * run description rather than the index list the draw path wanted, so
+         * every batch ended with idx_count == 0 and was dropped in silence.
+         *
+         * Expanded into indices because that is what the rasteriser consumes,
+         * and an implicit run is just the indices start..start+count-1. */
+        uint32_t start = param & 0x00FFFFFFu;
+        uint32_t count = ((param >> 24) & 0xFFu) + 1u;
+        uint32_t i;
+
+        if (!s_gpu.prim)
+            break;
+        for (i = 0; i < count && s_gpu.idx_count < NV_MAX_INDICES; i++)
+            s_gpu.idx[s_gpu.idx_count++] = (uint16_t)(start + i);
+        break;
+    }
+
     case NV097_ARRAY_ELEMENT16:
         /* Two 16-bit indices per parameter word. */
         if (s_gpu.prim && s_gpu.idx_count + 2 <= NV_MAX_INDICES) {
@@ -1661,6 +1953,23 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
         /* And this is a completed swap, which is what a title's own swap
          * counter counts -- see xbox_Nv2aFrameCounterFlip. */
         xbox_Nv2aFrameCounterFlip();
+        /* Hand the window a copy of the frame just finished.
+         *
+         * The buffer the title has finished is the one the last batch drew
+         * into, which is what drawn_offset holds and why it exists -- by now
+         * color_offset has moved to the next buffer. Copying here, rather
+         * than letting the window read guest memory on its own clock, is
+         * also what stops it showing a surface the rasteriser is still
+         * writing: that was the flicker. */
+        if (s_gpu.pitch) {
+            extern void xbox_FramebufferWindowPresent(uint32_t, uint32_t);
+            uint32_t done = s_gpu.drawn_offset ? s_gpu.drawn_offset
+                                               : s_gpu.color_offset;
+            if (done) {
+                xbox_FramebufferWindowSet(dma_resolve(done), s_gpu.pitch);
+                xbox_FramebufferWindowPresent(dma_resolve(done), s_gpu.pitch);
+            }
+        }
         if (getenv("RECOMP_PB_EXEC_VERBOSE")) {
             static unsigned n;
             if (n++ < 8) {
@@ -1726,6 +2035,22 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
             a->type   =  param        & 0x0F;
             a->size   = (param >> 4)  & 0x0F;
             a->stride = (param >> 8)  & 0xFF;
+        } else if (method == 0x1E94) {          /* TRANSFORM_EXECUTION_MODE */
+            s_gpu.xform_mode = param;
+        } else if (method == 0x1E9C) {          /* TRANSFORM_PROGRAM_LOAD */
+            s_vp_prog_load = param; s_vp_prog_dw = 0;
+        } else if (method == 0x1EA4) {          /* TRANSFORM_CONSTANT_LOAD */
+            s_vp_const_load = param; s_vp_const_dw = 0;
+        } else if (method >= 0x0B00 && method <= 0x0B7C) {
+            vp_load_program_word(param);
+        } else if (method >= 0x0B80 && method <= 0x0BFC) {
+            vp_load_constant_word(param);
+        } else if (method >= 0x0A20 && method <= 0x0A2C) {
+            memcpy(&s_vp_viewport_off[(method - 0x0A20) / 4], &param, 4);
+            s_vp_have_viewport |= 1;
+        } else if (method >= 0x0AF0 && method <= 0x0AFC) {
+            memcpy(&s_vp_viewport_scale[(method - 0x0AF0) / 4], &param, 4);
+            s_vp_have_viewport |= 2;
         } else if (!imm_vertex_method(method, param)) {
             note_unhandled(method, param);
         }

@@ -71,3 +71,4 @@ target_link_libraries(xboxrecomp INTERFACE
     xbox_video
 )
 
+add_subdirectory(src/game)

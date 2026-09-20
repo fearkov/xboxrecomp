@@ -36,9 +36,21 @@ typedef UCHAR KIRQL, *PKIRQL;
 typedef CCHAR KPROCESSOR_MODE;
 typedef LONG KPRIORITY;
 
-/* Processor modes */
-#define KernelMode  0
-#define UserMode    1
+/* Processor modes.
+ *
+ * Enum constants, not #defines. "KernelMode" and "UserMode" are ordinary
+ * words, and the Windows SDK uses both as struct member names: WINBOOL
+ * KernelMode in <rpcasync.h>, and the KernelMode/UserMode bitfields of
+ * SYSTEM_SUPPORTED_PROCESSOR_ARCHITECTURES_INFORMATION in <winnt.h>. An
+ * object-like macro rewrites those declarations to "WINBOOL 0;" in any
+ * translation unit that reaches an SDK header after this one -- which is
+ * every kernel .c file under MinGW. Enum constants sit in the ordinary
+ * identifier namespace; struct members have their own, so the names coexist.
+ * The values are what they were. */
+enum {
+    KernelMode = 0,
+    UserMode   = 1
+};
 
 /* IRQL levels (Xbox uses same NT IRQL model) */
 #define PASSIVE_LEVEL   0
@@ -760,6 +772,11 @@ VOID    __stdcall xbox_HalInitiateShutdown(void);
 BOOLEAN __stdcall xbox_HalIsResetOrShutdownPending(void);
 
 KIRQL   __fastcall xbox_KfRaiseIrql(KIRQL NewIrql);
+/* Non-zero while any thread holds IRQL at or above DISPATCH_LEVEL.
+ * Device models ask before delivering an interrupt; raising IRQL masks the
+ * line for the whole processor on hardware, not just for one thread. */
+int     xbox_IrqlBlocksInterrupts(void);
+int     xbox_IrqlRaisedCount(void);
 VOID    __fastcall xbox_KfLowerIrql(KIRQL NewIrql);
 KIRQL   __stdcall xbox_KeRaiseIrqlToDpcLevel(void);
 

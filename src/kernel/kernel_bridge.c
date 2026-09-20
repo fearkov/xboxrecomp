@@ -145,7 +145,16 @@ static void kernel_data_init(void)
      *   +4: UCHAR GpuRevision
      *   +5: UCHAR McpRevision
      */
-    BRIDGE_MEM32(XBOX_KERNEL_DATA_BASE + KDATA_HARDWARE_INFO + 0) = 0;   /* Retail */
+    {
+        /* Flags. Bit 0 changes how XAPI numbers the controller ports: with it
+         * clear, XAPI walks the root hub of the one OHCI it registers and
+         * calls those two ports 2 and 3, which makes a pad in the first
+         * socket player 3. RECOMP_HW_FLAGS is here to measure which value a
+         * title actually wants rather than to assert one. */
+        const char *f = getenv("RECOMP_HW_FLAGS");
+        BRIDGE_MEM32(XBOX_KERNEL_DATA_BASE + KDATA_HARDWARE_INFO + 0) =
+            f ? (uint32_t)strtoul(f, NULL, 0) : 0u;   /* Retail */
+    }
     BRIDGE_MEM8(XBOX_KERNEL_DATA_BASE + KDATA_HARDWARE_INFO + 4) = 0xA1; /* NV2A A1 */
     BRIDGE_MEM8(XBOX_KERNEL_DATA_BASE + KDATA_HARDWARE_INFO + 5) = 0xB1; /* MCPX B1 */
 
@@ -179,8 +188,48 @@ static void kernel_data_init(void)
      */
     {
         const char *cmdline = getenv("RECOMP_CMDLINE");
+        const char *relaunch = getenv("RECOMP_LAUNCH_DATA");
 
-        if (cmdline && *cmdline) {
+        if (relaunch && *relaunch) {
+            /* This boot is the second half of a title's own reboot.
+             *
+             * A title that calls XLaunchNewImage on itself is not quitting,
+             * it is asking for a cold start with a message left behind --
+             * DDS9 builds its texture-stream cache on Partition5, then
+             * reboots so the next boot can use it. On hardware the launch
+             * data page survives the quick reboot in a reserved physical
+             * page; here the previous process handed it over and this
+             * restores it, which is the same contract.
+             *
+             * Restoring beats re-entering the entry point in-process: the
+             * title expects untouched statics and a fresh heap, and nothing
+             * short of a new process gives it those. */
+            uint32_t page = xbox_HeapAlloc(0x1000 + 0x0C00, 4096);
+            if (page) {
+                size_t i;
+
+                for (i = 0; i < 0x1000; i++) {
+                    char hi = relaunch[i * 2], lo = relaunch[i * 2 + 1];
+                    int v;
+
+                    if (!hi || !lo)
+                        break;
+                    v = ((hi <= '9' ? hi - '0' : (hi | 32) - 'a' + 10) << 4)
+                      |  (lo <= '9' ? lo - '0' : (lo | 32) - 'a' + 10);
+                    BRIDGE_MEM8(page + (uint32_t)i) = (uint8_t)v;
+                }
+                BRIDGE_MEM32(XBOX_KERNEL_DATA_BASE + KDATA_LAUNCH_DATA_PAGE) =
+                    page;
+                fprintf(stderr, "  Launch data: restored %u bytes at 0x%08X"
+                                " (type=%u titleid=0x%08X, relaunch #%s)\n",
+                        (unsigned)i, page, BRIDGE_MEM32(page),
+                        BRIDGE_MEM32(page + 4),
+                        getenv("RECOMP_RELAUNCH_GEN")
+                            ? getenv("RECOMP_RELAUNCH_GEN") : "1");
+            } else {
+                BRIDGE_MEM32(XBOX_KERNEL_DATA_BASE + KDATA_LAUNCH_DATA_PAGE) = 0;
+            }
+        } else if (cmdline && *cmdline) {
             uint32_t page = xbox_HeapAlloc(0x1000 + 0x0C00, 4096);
             if (page) {
                 size_t n = strlen(cmdline);
@@ -581,6 +630,12 @@ static void bridge_PsCreateSystemThreadEx(void)
  * NTSTATUS NtClose(HANDLE Handle)
  * Handle is a value (not a pointer), so safe for generic call.
  */
+
+/* Asynchronous-handle bookkeeping, defined with the file bridges below. */
+static void bridge_note_async_handle(uint32_t token);
+static void bridge_forget_async_handle(uint32_t token);
+static int  bridge_handle_is_async(uint32_t token);
+
 /* Handle-table helpers; defined further below. Xbox memory slots are 32-bit
  * but native HANDLEs are 64-bit pointers, so handles are kept in a table and
  * referenced by tagged 32-bit tokens. */
@@ -595,6 +650,8 @@ static void bridge_NtClose(void)
         fprintf(stderr, "  [KERNEL] NtClose: handle=0x%08X\n", raw_handle);
         fflush(stderr);
     }
+
+    bridge_forget_async_handle(raw_handle);
 
     /* Close real handles but skip fake/synthetic ones */
     if (raw_handle && raw_handle != 0xDEAD0001u && raw_handle != 0xBEEF0010u) {
@@ -1087,6 +1144,99 @@ static void bridge_ExQueryNonVolatileSetting(void)
  *
  * It never returns on hardware. Returning here would let the game run on past
  * a decision to quit, which reads as a hang rather than an exit. */
+/* Carry out a title's own reboot instead of exiting.
+ *
+ * XLaunchNewImage on hardware is: fill the launch data page, quick-reboot,
+ * and the named image starts with that page intact. When the image named is
+ * the title itself -- empty path, own title id -- the whole point is a cold
+ * start that can see what the previous boot left behind. DDS9 does this after
+ * building its texture cache, and treating it as an exit is why the title
+ * stopped one step short of its menu with no error: it had not failed, it had
+ * asked to be started again.
+ *
+ * A new process rather than a second call to the entry point, because what
+ * the title is asking for is precisely the state a re-entry would not give
+ * it: zeroed statics, an empty heap, and the loader running again.
+ *
+ * Returns 0 if the caller should carry on exiting -- feature off, generation
+ * cap reached, or the relaunch could not be started. Does not return when it
+ * succeeds.
+ */
+static int bridge_relaunch_title(uint32_t page)
+{
+    static const char hex[] = "0123456789abcdef";
+    char *blob;
+    char gen_buf[16];
+    unsigned gen, max;
+    const char *s_gen = getenv("RECOMP_RELAUNCH_GEN");
+    const char *s_max = getenv("RECOMP_RELAUNCH_MAX");
+    char exe[MAX_PATH];
+    STARTUPINFOA si;
+    PROCESS_INFORMATION pi;
+    uint32_t i;
+
+    /* Bounded on purpose. A title whose second boot does not get past the
+     * same check reboots again, and an unbounded loop of 90-second boots is
+     * indistinguishable from a hang while being much harder to read. Four is
+     * enough for the chain DDS9 actually uses; 0 turns the whole thing off. */
+    max = s_max ? (unsigned)atoi(s_max) : 4u;
+    gen = s_gen ? (unsigned)atoi(s_gen) : 0u;
+    if (max == 0)
+        return 0;
+    if (gen >= max) {
+        fprintf(stderr, "  [KERNEL] relaunch #%u refused:"
+                        " RECOMP_RELAUNCH_MAX=%u reached\n", gen + 1, max);
+        return 0;
+    }
+
+    if (!GetModuleFileNameA(NULL, exe, sizeof exe))
+        return 0;
+
+    blob = (char *)malloc(0x1000 * 2 + 1);
+    if (!blob)
+        return 0;
+    for (i = 0; i < 0x1000; i++) {
+        uint8_t b = BRIDGE_MEM8(page + i);
+        blob[i * 2]     = hex[b >> 4];
+        blob[i * 2 + 1] = hex[b & 0xF];
+    }
+    blob[0x1000 * 2] = 0;
+
+    /* Through the environment rather than a file: the page is handed to one
+     * specific child and cannot outlive it, so an unrelated later run can
+     * never pick up a stale reboot message. */
+    sprintf(gen_buf, "%u", gen + 1);
+    if (!SetEnvironmentVariableA("RECOMP_LAUNCH_DATA", blob)
+            || !SetEnvironmentVariableA("RECOMP_RELAUNCH_GEN", gen_buf)) {
+        free(blob);
+        return 0;
+    }
+
+    memset(&si, 0, sizeof si);
+    si.cb = sizeof si;
+    memset(&pi, 0, sizeof pi);
+
+    fprintf(stderr, "  [KERNEL] relaunch #%s: restarting %s"
+                    " with the title's launch data\n", gen_buf, exe);
+    fflush(stderr);
+    fflush(stdout);
+
+    /* Handles inherited so the child keeps writing to the same stdout and
+     * stderr; the log of a reboot chain is one log. */
+    if (!CreateProcessA(exe, GetCommandLineA(), NULL, NULL, TRUE,
+                        0, NULL, NULL, &si, &pi)) {
+        fprintf(stderr, "  [KERNEL] relaunch failed: CreateProcess err=%lu\n",
+                (unsigned long)GetLastError());
+        free(blob);
+        return 0;
+    }
+    CloseHandle(pi.hThread);
+    CloseHandle(pi.hProcess);
+    free(blob);
+    _exit(0);
+    return 1;
+}
+
 static void bridge_HalReturnToFirmware(void)
 {
     uint32_t routine = STACK_ARG(0);
@@ -1143,6 +1293,7 @@ static void bridge_HalReturnToFirmware(void)
         fflush(stderr);
     }
 
+    xbox_PeekSample("exit peek");
     fprintf(stderr, "  [KERNEL] HalReturnToFirmware: routine=%u - title is exiting\n",
             routine);
     fflush(stderr);
@@ -1172,6 +1323,28 @@ static void bridge_HalReturnToFirmware(void)
         if (waited)
             fprintf(stderr, "  [KERNEL] waited %dms for the video to finish\n",
                     waited);
+    }
+
+    /* Reboot-with-a-message is a relaunch, not an exit. Only for the reboot
+     * routines: routine 0 is a halt and routine 4 is a fatal error, and
+     * restarting either of those would be inventing an intent the title did
+     * not express. */
+    if (routine == 1 || routine == 2) {
+        uint32_t page =
+            BRIDGE_MEM32(XBOX_KERNEL_DATA_BASE + KDATA_LAUNCH_DATA_PAGE);
+
+        /* Only when the page names an image.
+         *
+         * XLaunchNewImage(NULL, data) launches the DASHBOARD, and that is
+         * what an empty path here means -- the title id in the header is the
+         * caller recording itself, not a request to start itself again. The
+         * XAPI startup stub calls XapiBootToDash the moment main() returns,
+         * so every ordinary end-of-title looks exactly like this, and
+         * restarting on it turns "the game finished" into a boot loop. There
+         * is no dashboard to launch, so that case is an exit. */
+        if (page && BRIDGE_MEM8(page + 8) != 0
+                && bridge_relaunch_title(page))
+            return; /* not reached: the helper never returns on success */
     }
 
     xbox_HalReturnToFirmware(routine);
@@ -1210,16 +1383,19 @@ static void bridge_ExAllocatePoolWithTag(void)
 }
 
 /* ── KfRaiseIrql / KfLowerIrql (ordinals 160, 161) ────── */
+/* Both are __fastcall: the new level arrives in ECX and nothing is pushed.
+ * Read off the stack instead and the level is whatever the caller's frame
+ * happened to hold -- 48, 188, 232 were all observed on a real title, none of
+ * them an IRQL. The levels then disagree with each other, so a raise/lower
+ * pair no longer nets out and anything counting them drifts. */
 static void bridge_KfRaiseIrql(void)
 {
-    uint32_t new_irql = STACK_ARG(0);
-    g_eax = (uint32_t)xbox_KfRaiseIrql((UCHAR)new_irql);
+    g_eax = (uint32_t)xbox_KfRaiseIrql((UCHAR)g_ecx);
 }
 
 static void bridge_KfLowerIrql(void)
 {
-    uint32_t new_irql = STACK_ARG(0);
-    xbox_KfLowerIrql((UCHAR)new_irql);
+    xbox_KfLowerIrql((UCHAR)g_ecx);
     g_eax = 0;
 }
 
@@ -1894,6 +2070,14 @@ static void bridge_KeInsertQueueDpc(void)
         g_eax = 0;
         return;
     }
+    if (getenv("RECOMP_DPC_TRACE")) {
+        static unsigned n;
+        if (n++ < 40) {
+            fprintf(stderr, "  [DPC] queued routine 0x%08X (a1=%08X a2=%08X)\n",
+                    BRIDGE_MEM32(dpc + 8), arg1, arg2);
+            fflush(stderr);
+        }
+    }
     g_dpc_queue[tail].dpc  = dpc;
     g_dpc_queue[tail].arg1 = arg1;
     g_dpc_queue[tail].arg2 = arg2;
@@ -2396,6 +2580,26 @@ static void bridge_RtlNtStatusToDosError(void)
     case 0xC0000008: g_eax = 6; break;          /* STATUS_INVALID_HANDLE → ERROR_INVALID_HANDLE */
     case 0xC0000017: g_eax = 8; break;          /* STATUS_NO_MEMORY → ERROR_NOT_ENOUGH_MEMORY */
     case 0xC000000D: g_eax = 87; break;         /* STATUS_INVALID_PARAMETER → ERROR_INVALID_PARAMETER */
+
+    /* The informational codes, which are not failures and must not fall
+     * through to the generic answer.
+     *
+     * 317 is ERROR_MR_MID_NOT_FOUND -- "no message text for this number" --
+     * and it is what Windows gives for a status it cannot name. As a default
+     * it is honest, but a caller that asks "is this in flight?" gets "no",
+     * because 317 is not ERROR_IO_PENDING. Shin Megami Tensei: Nine asks
+     * exactly that after starting the read for its title screen, and took the
+     * wrong branch for the rest of the run. */
+    case 0x00000103: g_eax = 997; break;        /* STATUS_PENDING → ERROR_IO_PENDING */
+    case 0x00000102: g_eax = 1460; break;       /* STATUS_TIMEOUT → ERROR_TIMEOUT */
+    case 0x00000104: g_eax = 0; break;          /* STATUS_REPARSE → ERROR_SUCCESS */
+    case 0x80000005: g_eax = 234; break;        /* STATUS_BUFFER_OVERFLOW → ERROR_MORE_DATA */
+    case 0x80000006: g_eax = 18; break;         /* STATUS_NO_MORE_FILES → ERROR_NO_MORE_FILES */
+    case 0xC0000011: g_eax = 38; break;         /* STATUS_END_OF_FILE → ERROR_HANDLE_EOF */
+    case 0xC0000023: g_eax = 122; break;        /* STATUS_BUFFER_TOO_SMALL → ERROR_INSUFFICIENT_BUFFER */
+    case 0xC0000035: g_eax = 183; break;        /* STATUS_OBJECT_NAME_COLLISION → ERROR_ALREADY_EXISTS */
+    case 0xC00000BB: g_eax = 50; break;         /* STATUS_NOT_SUPPORTED → ERROR_NOT_SUPPORTED */
+
     default:         g_eax = 317; break;         /* ERROR_MR_MID_NOT_FOUND (generic) */
     }
 }
@@ -2541,6 +2745,35 @@ static void bridge_build_oa(uint32_t obj_attrs_va,
     oa->Attributes    = 0;
 }
 
+/*
+ * The DVD drive as a device, not as a directory.
+ *
+ * A title that checks its media opens "\\Device\\CdRom0" itself -- the bare
+ * device, with nothing after it -- and then issues IOCTLs on the handle. The
+ * path table in kernel_path.c only carries the "\\Device\\CdRom0\\" form with
+ * the separator, which is the prefix for reading a *file* off the disc, so the
+ * bare open matched no rule, was reported as "Unrecognized Xbox path", and came
+ * back STATUS_OBJECT_PATH_NOT_FOUND. DDS9 reads that as "no disc" and exits
+ * through HalReturnToFirmware before it draws a frame.
+ *
+ * There is nothing on the host to open here: the game directory is a
+ * directory, and a directory handle would not answer the IOCTLs that follow.
+ * So the open returns a synthetic handle, in the same style as the ones
+ * NtCreateDirectoryObject and the partition devices already hand out. It is
+ * deliberately untagged, which bridge_resolve_handle passes through unchanged,
+ * and distinct so bridge_NtDeviceIoControlFile can recognise it by value.
+ *
+ * Accepts the "\??\" prefix, since titles reach the device both ways.
+ */
+#define BRIDGE_CDROM_HANDLE 0xDECD0001u
+
+static int bridge_is_cdrom_device(const char *path)
+{
+    if (!path) return 0;
+    if (_strnicmp(path, "\\??\\", 4) == 0) path += 4;
+    return _stricmp(path, "\\Device\\CdRom0") == 0;
+}
+
 /* Open a file by delegating to the ported xbox_NtCreateFile kernel HLE. */
 static NTSTATUS bridge_create_file_impl(
     uint32_t handle_va, ACCESS_MASK access, uint32_t obj_attrs_va,
@@ -2558,6 +2791,16 @@ static NTSTATUS bridge_create_file_impl(
         bridge_write_iostatus(iostatus_va, STATUS_OBJECT_PATH_NOT_FOUND, 0);
         return STATUS_OBJECT_PATH_NOT_FOUND;
     }
+
+    if (bridge_is_cdrom_device(name.Buffer)) {
+        fprintf(stderr, "  [FILE] %s -> synthetic DVD device handle\n",
+                name.Buffer);
+        if (handle_va)
+            BRIDGE_MEM32(handle_va) = BRIDGE_CDROM_HANDLE;
+        bridge_write_iostatus(iostatus_va, 0, 1 /* FILE_OPENED */);
+        return 0;
+    }
+
     memset(&ios, 0, sizeof(ios));
 
     st = xbox_NtCreateFile(&h, access, &oa, &ios, NULL,
@@ -2667,6 +2910,11 @@ static void bridge_NtCreateFile(void)
     g_eax = (uint32_t)bridge_create_file_impl(
         handle_va, access, obj_attrs, iostatus,
         file_attrs, share, disposition, options);
+
+    /* FILE_SYNCHRONOUS_IO_ALERT | FILE_SYNCHRONOUS_IO_NONALERT. Neither set
+     * means the caller wants asynchronous completion on this handle. */
+    if (g_eax == 0 && handle_va && (options & 0x30u) == 0u)
+        bridge_note_async_handle(BRIDGE_MEM32(handle_va));
 
     /* An FMV the host can decode itself.
      *
@@ -2940,6 +3188,63 @@ static void bridge_RtlUnwind(void)
         g_esp += 0x50;
 }
 
+
+/* Which open file handles were asked for asynchronously.
+ *
+ * NtCreateFile takes FILE_SYNCHRONOUS_IO_ALERT (0x10) and
+ * FILE_SYNCHRONOUS_IO_NONALERT (0x20) in CreateOptions. With neither, the
+ * handle is asynchronous and NtReadFile on it returns STATUS_PENDING even
+ * with no event: the caller is told the request is in flight and waits on
+ * the handle. Completing every read synchronously answers a different
+ * question than the one that was asked, and a title written against the real
+ * contract reads the answer as "nothing started".
+ *
+ * A flat array because a title has a handful of files open at once and a
+ * linear scan of sixty-four entries costs less than the hash would.
+ */
+#define BRIDGE_ASYNC_MAX 64
+static uint32_t g_async_handles[BRIDGE_ASYNC_MAX];
+
+static void bridge_note_async_handle(uint32_t token)
+{
+    int i;
+    if (!token)
+        return;
+    for (i = 0; i < BRIDGE_ASYNC_MAX; i++)
+        if (g_async_handles[i] == token)
+            return;
+    for (i = 0; i < BRIDGE_ASYNC_MAX; i++)
+        if (!g_async_handles[i]) { g_async_handles[i] = token; return; }
+}
+
+static void bridge_forget_async_handle(uint32_t token)
+{
+    int i;
+    for (i = 0; i < BRIDGE_ASYNC_MAX; i++)
+        if (g_async_handles[i] == token) { g_async_handles[i] = 0; return; }
+}
+
+static int bridge_handle_is_async(uint32_t token)
+{
+    int i;
+    if (!token)
+        return 0;
+    for (i = 0; i < BRIDGE_ASYNC_MAX; i++)
+        if (g_async_handles[i] == token)
+            return 1;
+    return 0;
+}
+
+/* Off unless RECOMP_ASYNC_IO is set, so the change can be measured against
+ * the behaviour it replaces rather than swapped in blind. */
+static int bridge_async_io_enabled(void)
+{
+    static int on = -1;
+    if (on < 0)
+        on = getenv("RECOMP_ASYNC_IO") ? 1 : 0;
+    return on;
+}
+
 /* ── NtReadFile (ordinal 219, 8 args = 32 bytes) ──────── */
 static void bridge_NtReadFile(void)
 {
@@ -2973,13 +3278,15 @@ static void bridge_NtReadFile(void)
          * early looks identical to one that never started -- until you can
          * see where each one landed. */
         if (poff)
-            fprintf(stderr, "  [READ] @%lld want=%u got=%u st=0x%08X  %02X %02X %02X %02X\n",
+            fprintf(stderr, "  [READ] from=0x%08X ev=%08X apc=%08X @%lld want=%u got=%u st=0x%08X  %02X %02X %02X %02X\n",
+                    g_xbox_kernel_caller, STACK_ARG(1), STACK_ARG(2),
                     (long long)off.QuadPart, length, got,
                     (uint32_t)ios.Status,
                     got > 0 ? p[0] : 0, got > 1 ? p[1] : 0,
                     got > 2 ? p[2] : 0, got > 3 ? p[3] : 0);
         else
-            fprintf(stderr, "  [READ] @seq want=%u got=%u st=0x%08X  %02X %02X %02X %02X\n",
+            fprintf(stderr, "  [READ] from=0x%08X @seq want=%u got=%u st=0x%08X  %02X %02X %02X %02X\n",
+                    g_xbox_kernel_caller,
                     length, got, (uint32_t)ios.Status,
                     got > 0 ? p[0] : 0, got > 1 ? p[1] : 0,
                     got > 2 ? p[2] : 0, got > 3 ? p[3] : 0);
@@ -2988,6 +3295,30 @@ static void bridge_NtReadFile(void)
     bridge_write_iostatus(iostatus, ios.Status, (uint32_t)ios.Information);
     bridge_complete_file_io(STACK_ARG(1), STACK_ARG(2), STACK_ARG(3),
                             iostatus);
+
+    /* An asynchronous request returns STATUS_PENDING, even when the data was
+     * already there.
+     *
+     * A caller that passes an event or an APC routine is asking to be told
+     * later, and on Windows it is: the read returns 0x00000103 and the status
+     * block carries the result once the event signals. Returning
+     * STATUS_SUCCESS instead is not a harmless shortcut -- it is a different
+     * contract, and code written for the real one takes the branch that says
+     * "nothing is in flight".
+     *
+     * Shin Megami Tensei: Nine reads its title screen this way. Its resource
+     * object marks itself busy only on the pending path, so with a synchronous
+     * answer the object never entered the loading state, the poll that
+     * finishes the load returned "not started" forever, and the title sat on a
+     * black screen in boot state 0 with everything else working.
+     *
+     * The read itself stays synchronous here: the event is already signalled
+     * and the status block already written, so a caller that waits is
+     * satisfied immediately. Only the answer changes. */
+    if (STACK_ARG(1) || STACK_ARG(2)
+            || (bridge_async_io_enabled()
+                && bridge_handle_is_async(STACK_ARG(0))))
+        g_eax = STATUS_PENDING;
 }
 
 /* ── NtWriteFile (ordinal 236, 8 args = 32 bytes) ─────── */
@@ -3229,10 +3560,92 @@ static void bridge_IoCreateFile(void)
 
 static void bridge_NtDeviceIoControlFile(void)
 {
+    uint32_t handle  = STACK_ARG(0);
     uint32_t ios_va  = STACK_ARG(4);
     uint32_t ioctl   = STACK_ARG(5);
     uint32_t out_va  = STACK_ARG(8);
     uint32_t out_len = STACK_ARG(9);
+
+    /* IOCTLs aimed at the DVD device (see bridge_is_cdrom_device).
+     *
+     * These are the media check: the title asks the drive to confirm a disc is
+     * present and that it is the one it expects. There is no drive here and no
+     * disc to describe, so the honest answer is the one that lets the title
+     * proceed -- the alternative is STATUS_NOT_SUPPORTED, which it reads as a
+     * failed check and answers with HalReturnToFirmware.
+     *
+     * Reported rather than silent: which codes a title sends is the useful
+     * fact when the check still fails, and guessing at them from documentation
+     * is how this layer accumulates handlers for IOCTLs nothing ever sends. The
+     * output buffer is zeroed, so a title that reads a result field back sees a
+     * defined value instead of whatever was on its heap. */
+    if (handle == BRIDGE_CDROM_HANDLE) {
+        uint32_t in_va  = STACK_ARG(6);
+        uint32_t in_len = STACK_ARG(7);
+
+        /* The media check arrives as a SCSI pass-through, so the answer the
+         * title reads is not the IOCTL's output buffer -- that is NULL here,
+         * with length zero -- but the DataBuffer the request points at.
+         * Returning STATUS_SUCCESS alone leaves that buffer as the title
+         * zeroed it, which it reads as a failed check; DDS9 retries five
+         * times and then exits through HalReturnToFirmware.
+         *
+         * SCSI_PASS_THROUGH_DIRECT, 32-bit layout, 44 bytes:
+         *   0 Length(USHORT)  2 ScsiStatus  3 PathId  4 TargetId  5 Lun
+         *   6 CdbLength  7 SenseInfoLength  8 DataIn
+         *   12 DataTransferLength  16 TimeOutValue  20 DataBuffer
+         *   24 SenseInfoOffset  28 Cdb[16] */
+        if (in_va && in_len >= 44 && BRIDGE_MEM8(in_va + 28) == 0x5A) {
+            uint32_t data_va  = BRIDGE_MEM32(in_va + 20);
+            uint32_t data_len = BRIDGE_MEM32(in_va + 12);
+            uint32_t page     = BRIDGE_MEM8(in_va + 30) & 0x3F;
+
+            fprintf(stderr, "  [FILE] DVD MODE SENSE(10) page 0x%02X, "
+                            "%u bytes -> authentication page\n", page, data_len);
+
+            if (data_va && data_len) {
+                uint32_t i;
+                for (i = 0; i < data_len; i++)
+                    BRIDGE_MEM8(data_va + i) = 0;
+
+                /* An 8-byte MODE SENSE(10) parameter header, then the page.
+                 * The three bytes that matter are named by the title's own
+                 * validation at guest 0x0021EA56-0x0021EA6D, which is the only
+                 * specification of this page there is: byte 11 must be exactly
+                 * 1, and bytes 10 and 12 must both be non-zero. Anything else
+                 * is read as "not the expected disc". */
+                if (data_len >= 2) {
+                    BRIDGE_MEM8(data_va + 0) = 0;
+                    BRIDGE_MEM8(data_va + 1) = 26;   /* mode data length */
+                }
+                if (data_len >= 10) {
+                    BRIDGE_MEM8(data_va + 8) = 0x3E; /* page code */
+                    BRIDGE_MEM8(data_va + 9) = 18;   /* page length */
+                }
+                if (data_len >= 13) {
+                    BRIDGE_MEM8(data_va + 10) = 1;   /* non-zero */
+                    BRIDGE_MEM8(data_va + 11) = 1;   /* exactly 1 */
+                    BRIDGE_MEM8(data_va + 12) = 1;   /* non-zero */
+                }
+            }
+
+            BRIDGE_MEM8(in_va + 2) = 0;              /* ScsiStatus = GOOD */
+            bridge_write_iostatus(ios_va, 0, in_len);
+            g_eax = 0;
+            return;
+        }
+
+        fprintf(stderr, "  [FILE] DVD device IOCTL 0x%X (in=%u out=%u) "
+                        "-> STATUS_SUCCESS\n", ioctl, in_len, out_len);
+        if (out_va && out_len) {
+            uint32_t i;
+            for (i = 0; i < out_len; i++)
+                BRIDGE_MEM8(out_va + i) = 0;
+        }
+        bridge_write_iostatus(ios_va, 0, out_len);
+        g_eax = 0;
+        return;
+    }
 
     if (ioctl == IOCTL_DISK_GET_DRIVE_GEOMETRY) {
         /* DISK_GEOMETRY: Cylinders (LARGE_INTEGER), MediaType,

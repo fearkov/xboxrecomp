@@ -1196,6 +1196,40 @@ def detect_setjmp_helpers(func_db, xbe_data, verbose=False):
     return found.get("setjmp"), found.get("longjmp")
 
 
+def normalise_zero_test(mnemonic, ops):
+    """`test X, X` is `cmp X, 0`, and saying so keeps a branch alive.
+
+    The two leave every flag identical: both compute X, so ZF, SF and PF come
+    out the same, and both clear CF and OF. What differs is only how the
+    snapshot reconstructs them -- a cmp answers `je` with `_fa == _fb`, a test
+    with `(_fa & _fb) == 0` -- and that difference is enough to stop two
+    predecessors merging at a join. `_merge_flag_states` requires one
+    operation across all of them, so a block reached by `cmp [x], 0` one way
+    and `test eax, eax` the other inherits no state at all and its jcc
+    compiles as the `_flags` fallback, which nothing assigns: the branch is
+    never taken.
+
+    That is not hypothetical. It is how Shin Megami Tensei: Nine's video
+    decoder loses its picture. sub_002C4D63 returns the mask saying which
+    coefficient groups carry AC terms, and the IDCT it feeds has a DC-only
+    shortcut for the groups whose bit is clear -- which writes a row of one
+    repeated value. With the branch dead the mask comes back wrong, every
+    group takes the shortcut, and each block comes out flat across its rows
+    while its columns survive. On screen that is a picture smeared
+    horizontally, with the vertical structure intact.
+
+    Normalising at the snapshot is what makes the merge legal rather than
+    forcing one through: after this both predecessors really are the same
+    operation on the same width, which is what the merge was asking.
+    """
+    if (mnemonic == "test" and len(ops) == 2
+            and ops[0].type == "reg" and ops[1].type == "reg"
+            and ops[0].reg and ops[0].reg == ops[1].reg):
+        return "cmp", [ops[0], Operand(type="imm", imm=0,
+                                       mem_size=ops[0].mem_size)]
+    return mnemonic, ops
+
+
 class Lifter:
     """Translates x86 instructions to C statements."""
 
@@ -1221,6 +1255,7 @@ class Lifter:
         self.needs_cf = False  # Set per-function by translator (has adc/sbb)
         self.publishes_ebp = False  # Set per-function: has a real frame
         self.trace_exit_name = None  # Set per-function when traced
+        self.force_return_value = None   # Set per-function by --force-return
         # Every direct call target we emit a name for, as {addr: name}. The
         # batch translator diffs this against the functions it actually defined
         # so it can stub out the remainder (see translate_batch_split).
@@ -1338,6 +1373,8 @@ class Lifter:
             return self._lift_sar(insn, ops)
         if m in ("rol", "ror"):
             return self._lift_rotate(insn, ops, m)
+        if m in ("rcl", "rcr"):
+            return self._lift_rotate_carry(insn, ops, m)
 
         # ── Comparison / test (standalone, not part of cmp+jcc pattern) ──
         if m == "cmp":
@@ -2041,6 +2078,37 @@ class Lifter:
         out.append(self._result_snapshot(ops, "sar"))
         return out
 
+    def _lift_rotate_carry(self, insn, ops, m):
+        """rcl/rcr: the carry flag is one of the bits being rotated.
+
+        These were falling through to the TODO comment, which is a silent
+        no-op. Where they appear is the compiler's own 64-bit divide:
+
+            shr ecx, 1
+            rcr ebx, 1        <- carries ecx's bit 0 into ebx's bit 31
+            shr edx, 1
+            rcr eax, 1
+            or  ecx, ecx
+            jnz ...
+
+        That loop normalises a 128-bit pair down to something a 32-bit
+        divide can take. With the rcr dropped the low halves never move, so
+        the divisor and the dividend both go into the divide wrong -- and
+        nothing says so.
+        """
+        if len(ops) < 2:
+            return [f"/* {m}: bad operands */"]
+        width = (_operand_width(ops[0]) or 4) * 8
+        dst = _fmt_operand_read(ops[0])
+        cnt = _fmt_operand_read(ops[1])
+        left = 1 if m == "rcl" else 0
+        write = _fmt_operand_write(ops[0], "_rcv")
+        return [
+            f"{{ uint32_t _rcv = RC_ROT((uint32_t)({dst}), (unsigned)({cnt}),"
+            f" &_cf, {width}, {left});",
+            f"  {write} }} /* {m} */",
+        ]
+
     def _lift_rotate(self, insn, ops, m):
         """A rotate is at the OPERAND's width, not always at 32 bits.
 
@@ -2122,10 +2190,14 @@ class Lifter:
         # _fa and _fb are already masked to the operand width, so their
         # unsigned comparison is CF at that width.
         if self.needs_cf:
-            if kind == "cmp":
+            zero_rhs = (ops[1].type == "imm" and not ops[1].imm)
+            if kind == "cmp" and not zero_rhs:
                 out.append("_cf = (int)(_fa < _fb);")
             else:
-                out.append("_cf = 0; /* test/cmp-logical clears CF */")
+                # An unsigned value is never below zero, so comparing against
+                # it cannot borrow -- which is also why `test X, X` normalises
+                # onto this form without changing CF.
+                out.append("_cf = 0; /* nothing borrows from zero */")
         return out
 
     def _lift_cmp(self, insn, ops):
@@ -2136,7 +2208,8 @@ class Lifter:
     def _lift_test(self, insn, ops):
         if len(ops) < 2:
             return ["/* test: bad operands */"]
-        return self._snapshot_flags(insn, ops, "test")
+        kind, ops = normalise_zero_test("test", ops)
+        return self._snapshot_flags(insn, ops, kind)
 
     # ── Control flow ──
 
@@ -2302,10 +2375,40 @@ class Lifter:
         if self.trace_exit_name:
             prefix = (f'RECOMP_TRACE_EXIT("{self.trace_exit_name}", '
                       f'0x{self.func_start:08X}); ') + prefix
+        # --force-return: hand the caller a constant instead of what the
+        # body computed.
+        #
+        # Set at the ret rather than skipped at the entry, which matters:
+        # the epilogue still runs, so esp is adjusted by the function's own
+        # ret -- 4 for a cdecl, 4+n for a stdcall -- and nothing has to guess
+        # the calling convention. The body's side effects still happen; only
+        # the answer changes. Off at run time unless RECOMP_FORCE_RETURN is
+        # set, so a build carrying it behaves normally by default.
+        if self.force_return_value is not None:
+            prefix = (f'if (g_force_return) eax = '
+                      f'0x{self.force_return_value:X}U; ') + prefix
+
         if len(ops) >= 1 and ops[0].type == "imm":
             n = ops[0].imm
             return [f"{prefix}esp += {4 + n}; return; /* ret {n} */"]
         return [f"{prefix}esp += 4; return; /* ret */"]
+
+    def _forced_tail(self, tail):
+        """Apply --force-return to a tail jump.
+
+        A tail call leaves through the target, not through a ret, so the
+        assignment has to land after the call and before the return -- the
+        target still runs, and the caller still gets the constant. Shin
+        Megami Tensei: Nine's XMV "is the movie finished" query ends in
+        exactly this shape, so without it the option would miss the function
+        that motivated it.
+        """
+        if self.force_return_value is None:
+            return tail
+        return tail.replace(
+            "; return;",
+            f"; if (g_force_return) eax = 0x{self.force_return_value:X}U;"
+            f" return;", 1)
 
     def _is_external_target(self, addr):
         """Check if a jump target is outside the current function."""
@@ -2392,7 +2495,7 @@ class Lifter:
                             f'"tail 0x{insn.jump_target:08X}");',
                             tail,
                         ]
-                    return [tail]
+                    return [self._forced_tail(tail)]
                 name = self._call_target_name(insn.jump_target)
                 tail = (f"g_seh_ebp = ebp; {name}(); return; "
                         f"/* tail jmp 0x{insn.jump_target:08X} */")
@@ -2403,7 +2506,7 @@ class Lifter:
                     # between measuring and guessing.
                     return [f'RECOMP_TRACE_ESP("{self.trace_exit_name}", '
                             f'"tail 0x{insn.jump_target:08X}");', tail]
-                return [tail]
+                return [self._forced_tail(tail)]
             return [f"goto loc_{insn.jump_target:08X};"]
         elif len(ops) >= 1:
             # Detect intra-function switch tables (computed gotos)
@@ -2442,7 +2545,9 @@ class Lifter:
                     lines.append("g_seh_ebp = ebp; RECOMP_ITAIL(_jt); return; }")
                     return lines
             target = _fmt_operand_read(ops[0])
-            return [f"g_seh_ebp = ebp; RECOMP_ITAIL({target}); return; /* indirect tail jmp */"]
+            return [self._forced_tail(
+                f"g_seh_ebp = ebp; RECOMP_ITAIL({target}); return;"
+                f" /* indirect tail jmp */")]
         return ["/* jmp: no target */"]
 
     def _lift_jcc(self, insn):
@@ -3529,8 +3634,8 @@ def lift_basic_block(lifter, bb, flag_state=None):
                 stmts.extend(lifter._snapshot_flags(
                     flag_insn, flag_insn.operands, flag_insn.mnemonic))
             stmts.append(stmt)
-            last_flag_setter = flag_insn.mnemonic
-            last_flag_ops = list(flag_insn.operands)
+            last_flag_setter, last_flag_ops = normalise_zero_test(
+                flag_insn.mnemonic, list(flag_insn.operands))
             i += consumed
             continue
 
@@ -3607,16 +3712,16 @@ def lift_basic_block(lifter, bb, flag_state=None):
 
         # Track flag-setting instructions
         if curr.mnemonic in FLAG_SETTERS:
-            last_flag_setter = curr.mnemonic
-            last_flag_ops = list(curr.operands)
+            last_flag_setter, last_flag_ops = normalise_zero_test(
+                curr.mnemonic, list(curr.operands))
         elif curr.mnemonic in _FLAGS_UNDEFINED:
             # Flags are undefined after these - clear tracking
             last_flag_setter = None
             last_flag_ops = []
         elif curr.mnemonic in _EFLAGS_SETTERS:
             # Additional flag-setting instructions
-            last_flag_setter = curr.mnemonic
-            last_flag_ops = list(curr.operands)
+            last_flag_setter, last_flag_ops = normalise_zero_test(
+                curr.mnemonic, list(curr.operands))
         elif curr.mnemonic in _EFLAGS_PRESERVE:
             pass  # These don't affect EFLAGS
         elif curr.mnemonic in ("fcompi", "fcomip", "fucomi", "fucompi",

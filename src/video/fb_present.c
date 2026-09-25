@@ -28,6 +28,20 @@ static volatile LONG s_fb_running;
 static uint32_t      s_fb_va, s_fb_pitch, s_fb_width = 640, s_fb_height = 480;
 static uint32_t     *s_rgb;           /* converted 32-bit copy for GDI */
 
+/* A finished frame, taken at the flip and shown until the next one.
+ *
+ * The window used to convert straight out of guest memory every 16 ms. Even
+ * pointed at the buffer the title had just finished, that races the executor
+ * drawing the next frame into the other one and, whenever the two swap, puts
+ * a half-drawn image on the screen -- which is the flicker. Copying the
+ * finished frame once per flip means the window never reads memory the
+ * rasteriser is writing, so what it shows cannot be half of anything.
+ *
+ * Two buffers and an index, swapped after the copy completes, so the window
+ * thread is never reading the one being filled. */
+static uint32_t     *s_present[2];
+static volatile LONG s_present_idx = -1;   /* -1 until the first flip */
+
 void xbox_FramebufferWindowSet(uint32_t fb_va, uint32_t pitch)
 {
     /* RECOMP_FB_VA pins the window to one guest address instead of following
@@ -41,10 +55,174 @@ void xbox_FramebufferWindowSet(uint32_t fb_va, uint32_t pitch)
         s_fb_pitch = pitch;
 }
 
+/* Called by the pushbuffer executor when the title flips. */
+void xbox_FramebufferWindowPresent(uint32_t fb_va, uint32_t pitch)
+{
+    const uint8_t *src;
+    LONG next;
+    uint32_t bpp, x, y;
+
+    if (!s_fb_running || !fb_va || !pitch)
+        return;
+    if (getenv("RECOMP_FB_VA"))
+        return;                       /* pinned: leave the old path alone */
+    next = (s_present_idx == 0) ? 1 : 0;
+    if (!s_present[next]) {
+        s_present[next] = (uint32_t *)calloc((size_t)s_fb_width * s_fb_height,
+                                             4);
+        if (!s_present[next])
+            return;
+    }
+    bpp = pitch / s_fb_width;
+    src = (const uint8_t *)((uintptr_t)fb_va + xbox_GetMemoryOffset());
+    for (y = 0; y < s_fb_height; y++) {
+        const uint8_t *row = src + (size_t)y * pitch;
+        uint32_t *dst = s_present[next] + (size_t)y * s_fb_width;
+
+        if (bpp == 4) {
+            memcpy(dst, row, (size_t)s_fb_width * 4);
+        } else if (bpp == 2) {
+            const uint16_t *p = (const uint16_t *)row;
+            for (x = 0; x < s_fb_width; x++) {
+                uint16_t v = p[x];
+                uint32_t r = (uint32_t)((v >> 11) & 0x1F) * 255u / 31u;
+                uint32_t g = (uint32_t)((v >>  5) & 0x3F) * 255u / 63u;
+                uint32_t b = (uint32_t)( v        & 0x1F) * 255u / 31u;
+                dst[x] = (r << 16) | (g << 8) | b;
+            }
+        } else {
+            memset(dst, 0, (size_t)s_fb_width * 4);
+        }
+    }
+    /* Published only once it is whole. */
+    InterlockedExchange(&s_present_idx, next);
+}
+
+/* Which keys are down, for the pad stand-in in src/input.
+ *
+ * GetAsyncKeyState looked like the cheaper way to ask and does not work
+ * here: it reads a state Wine keeps for the X server, and a guest process
+ * drawing through GDI never sees it change. The window that has the focus
+ * is the thing that receives the keys, so that is what has to remember
+ * them.
+ *
+ * Reading this needs no lock. Each entry is written only by the window
+ * thread and read only by the USB thread, one byte at a time, and a press
+ * seen a frame late is indistinguishable from one made a frame later. */
+static volatile unsigned char s_key_down[256];
+
+/* RECOMP_KEY_SCRIPT="<ms>:<vk>,..." -- press a key at a fixed time.
+ *
+ * Reaching a screen deep in a title to measure something there otherwise
+ * needs a person at the keyboard, and every rebuild costs another round of
+ * asking them. This drives the same path a real key takes -- the window's
+ * own key table, then the pad report -- rather than writing into the
+ * title's memory, which is what the older injection probe does and which
+ * raised this title's crash rate from two runs in ten to four in four.
+ *
+ * Times are milliseconds from the window opening, `vk` is hexadecimal:
+ *
+ *     RECOMP_KEY_SCRIPT="12000:0D,16000:28,17000:0D"
+ *
+ * Each press is held KEY_SCRIPT_HOLD_MS, which is long enough for the
+ * report to carry it at the rate the guest polls and short enough to read
+ * as a tap rather than a hold. */
+#define KEY_SCRIPT_MAX      32
+#define KEY_SCRIPT_HOLD_MS  150u
+
+static struct { unsigned at_ms, vk; int done; } s_key_script[KEY_SCRIPT_MAX];
+static unsigned s_key_script_len;
+static unsigned s_key_script_t0;
+
+static void key_script_init(void)
+{
+    const char *spec = getenv("RECOMP_KEY_SCRIPT");
+    const char *q = spec;
+    if (!spec || !*spec)
+        return;
+    while (*q && s_key_script_len < KEY_SCRIPT_MAX) {
+        char *e;
+        unsigned at = (unsigned)strtoul(q, &e, 10);
+        if (*e != ':')
+            break;
+        s_key_script[s_key_script_len].at_ms = at;
+        s_key_script[s_key_script_len].vk = (unsigned)strtoul(e + 1, &e, 16);
+        s_key_script_len++;
+        if (*e != ',')
+            break;
+        q = e + 1;
+    }
+    s_key_script_t0 = (unsigned)GetTickCount();
+    fprintf(stderr, "  [FBWIN] key script: %u events\n", s_key_script_len);
+    fflush(stderr);
+}
+
+/* Called from the window loop; releases a press once its hold has run. */
+static void key_script_tick(void)
+{
+    unsigned now, i;
+    if (!s_key_script_len)
+        return;
+    now = (unsigned)GetTickCount() - s_key_script_t0;
+    for (i = 0; i < s_key_script_len; i++) {
+        unsigned at = s_key_script[i].at_ms, vk = s_key_script[i].vk;
+        if (vk > 255)
+            continue;
+        if (!s_key_script[i].done && now >= at) {
+            if (now < at + KEY_SCRIPT_HOLD_MS) {
+                s_key_down[vk] = 1;
+            } else {
+                s_key_down[vk] = 0;
+                s_key_script[i].done = 1;
+                fprintf(stderr, "  [FBWIN] script released vk=0x%02X at %u ms\n",
+                        vk, now);
+                fflush(stderr);
+            }
+        }
+    }
+}
+
+int xbox_FramebufferKeyDown(int vk)
+{
+    if ((unsigned)vk > 255)
+        return 0;
+    return s_key_down[vk] != 0;
+}
+
 static LRESULT CALLBACK fb_wndproc(HWND h, UINT m, WPARAM w, LPARAM l)
 {
-    if (m == WM_CLOSE || m == WM_DESTROY) {
+    switch (m) {
+    case WM_CLOSE:
+    case WM_DESTROY:
         InterlockedExchange(&s_fb_running, 0);
+        return 0;
+
+    case WM_KEYDOWN:
+    case WM_SYSKEYDOWN:
+        if ((unsigned)w < 256)
+            s_key_down[w] = 1;
+        /* Edge-triggered, because sampling the held state once a second
+         * cannot tell a key that was never pressed from one that was
+         * tapped -- a 100 ms tap is caught about one time in ten, and that
+         * ambiguity wasted two rounds of "press Enter and tell me". */
+        if (getenv("RECOMP_KEY_TRACE")) {
+            static unsigned n;
+            if (n++ < 40) {
+                fprintf(stderr, "  [KEY] down vk=0x%02X\n", (unsigned)w);
+                fflush(stderr);
+            }
+        }
+        return 0;
+
+    case WM_KEYUP:
+    case WM_SYSKEYUP:
+        if ((unsigned)w < 256)
+            s_key_down[w] = 0;
+        return 0;
+
+    /* Alt-tabbing away with a key held would leave it held for ever. */
+    case WM_KILLFOCUS:
+        memset((void *)s_key_down, 0, sizeof s_key_down);
         return 0;
     }
     return DefWindowProcA(h, m, w, l);
@@ -166,13 +344,29 @@ static DWORD WINAPI fb_thread(LPVOID unused)
     fprintf(stderr, "  [FBWIN] framebuffer window open (%ux%u)\n",
             s_fb_width, s_fb_height);
 
+    key_script_init();
+
     while (InterlockedCompareExchange(&s_fb_running, 1, 1)) {
         MSG msg;
+        key_script_tick();
         while (PeekMessageA(&msg, NULL, 0, 0, PM_REMOVE)) {
             TranslateMessage(&msg);
             DispatchMessageA(&msg);
         }
-        if (s_fb_va && s_fb_pitch && s_rgb) {
+        if (s_present_idx >= 0 && s_rgb) {
+            /* A finished frame, published by the flip. Copied into s_rgb so
+             * the dump path and GDI see one consistent image even if the
+             * next flip lands mid-blit. */
+            LONG idx = s_present_idx;
+            if (s_present[idx])
+                memcpy(s_rgb, s_present[idx],
+                       (size_t)s_fb_width * s_fb_height * 4);
+            StretchDIBits(hdc, 0, 0, (int)s_fb_width, (int)s_fb_height,
+                          0, 0, (int)s_fb_width, (int)s_fb_height,
+                          s_rgb, &bi, DIB_RGB_COLORS, SRCCOPY);
+        } else if (s_fb_va && s_fb_pitch && s_rgb) {
+            /* No flip yet, or pinned with RECOMP_FB_VA: read guest memory as
+             * before, which is also what a title that never flips needs. */
             const uint8_t *src =
                 (const uint8_t *)((uintptr_t)s_fb_va + xbox_GetMemoryOffset());
             fb_convert(src, s_fb_pitch / s_fb_width);
@@ -181,12 +375,35 @@ static DWORD WINAPI fb_thread(LPVOID unused)
                           s_rgb, &bi, DIB_RGB_COLORS, SRCCOPY);
         }
         {
-            /* One dump, a few seconds in, so the title has had time to render
-             * something rather than catching the first blank frame. */
+            /* One dump a few seconds in, so the title has had time to render
+             * something rather than catching the first blank frame.
+             *
+             * RECOMP_FB_WINDOW_DUMP_EVERY=<frames> dumps repeatedly instead.
+             * This window follows the address AvSetDisplayMode gave, which is
+             * what the CRTC scans and therefore what a person sees; the
+             * pushbuffer executor's own dump follows its draw surface. With
+             * double buffering those are different buffers, and measuring
+             * progress from the executor's dump reports a blank screen while
+             * the window is showing the title's logo. Ask the window. */
             const char *dump = getenv("RECOMP_FB_DUMP");
+            const char *every = getenv("RECOMP_FB_WINDOW_DUMP_EVERY");
             static int frames;
-            if (dump && ++frames == 600)
+            int period = every ? atoi(every) : 0;
+            frames++;
+            if (dump && period > 0) {
+                /* Numbered, so a run leaves a frame sequence a video can be
+                 * assembled from rather than one file overwritten 2000
+                 * times. Five digits keeps the names sorting in order well
+                 * past any recording length. */
+                if (frames % period == 0) {
+                    static unsigned seq;
+                    char path[512];
+                    snprintf(path, sizeof path, "%s%05u.bmp", dump, seq++);
+                    xbox_FramebufferDumpBmp(path);
+                }
+            } else if (dump && frames == 600) {
                 xbox_FramebufferDumpBmp(dump);
+            }
         }
         Sleep(16);
     }
@@ -215,5 +432,6 @@ void xbox_FramebufferWindowStart(void)
 
 #else
 void xbox_FramebufferWindowSet(uint32_t fb_va, uint32_t pitch) { (void)fb_va; (void)pitch; }
+void xbox_FramebufferWindowPresent(uint32_t fb_va, uint32_t pitch) { (void)fb_va; (void)pitch; }
 void xbox_FramebufferWindowStart(void) {}
 #endif

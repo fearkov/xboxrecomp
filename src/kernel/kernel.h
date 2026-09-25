@@ -91,9 +91,6 @@ enum {
 #ifndef STATUS_INVALID_HANDLE
 #define STATUS_INVALID_HANDLE           ((NTSTATUS)0xC0000008L)
 #endif
-#ifndef STATUS_INVALID_INFO_CLASS
-#define STATUS_INVALID_INFO_CLASS       ((NTSTATUS)0xC0000003L)
-#endif
 #ifndef STATUS_INVALID_PARAMETER
 #define STATUS_INVALID_PARAMETER        ((NTSTATUS)0xC000000DL)
 #endif
@@ -686,7 +683,6 @@ NTSTATUS __stdcall xbox_NtQueryFullAttributesFile(
 NTSTATUS __stdcall xbox_NtQueryDirectoryFile(
     HANDLE FileHandle, HANDLE Event, PIO_APC_ROUTINE ApcRoutine, PVOID ApcContext,
     PXBOX_IO_STATUS_BLOCK IoStatusBlock, PVOID FileInformation, ULONG Length,
-    XBOX_FILE_INFORMATION_CLASS FileInformationClass,
     PXBOX_ANSI_STRING FileName, BOOLEAN RestartScan);
 
 NTSTATUS __stdcall xbox_NtFsControlFile(
@@ -776,6 +772,19 @@ VOID    __stdcall xbox_HalInitiateShutdown(void);
 BOOLEAN __stdcall xbox_HalIsResetOrShutdownPending(void);
 
 KIRQL   __fastcall xbox_KfRaiseIrql(KIRQL NewIrql);
+/* Non-zero while any thread holds IRQL at or above DISPATCH_LEVEL.
+ * Device models ask before delivering an interrupt; raising IRQL masks the
+ * line for the whole processor on hardware, not just for one thread. */
+int     xbox_IrqlBlocksInterrupts(void);
+int     xbox_IrqlRaisedCount(void);
+int     xbox_IrqlTransitions(void);
+void    xbox_IrqlDumpHolders(void);
+void    xbox_RegisterGuestThread(void);
+int     xbox_DispatchEnterForDpc(int budget_ms);
+void    xbox_DispatchLeaveForDpc(void);
+int     xbox_DispatchTimeouts(int dpc_side);
+int     xbox_DispatchContended(void);
+int     xbox_IrqlRaisedCount(void);
 VOID    __fastcall xbox_KfLowerIrql(KIRQL NewIrql);
 KIRQL   __stdcall xbox_KeRaiseIrqlToDpcLevel(void);
 

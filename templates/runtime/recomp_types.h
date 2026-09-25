@@ -108,6 +108,11 @@ extern ptrdiff_t g_xbox_mem_offset;
  *
  * These replace a hardcoded 0x00400000 cutoff that was only ever right for one
  * title -- see the comment where they are defined in xbox_memory_layout.c. */
+/* --force-return: read once at startup, so the check at each forced ret is a
+ * load rather than a getenv. Zero unless RECOMP_FORCE_RETURN is set, which is
+ * what lets a build carrying forced functions behave normally by default. */
+extern int g_force_return;
+
 extern uint32_t g_xbox_code_lo;
 extern uint32_t g_xbox_code_hi;
 
@@ -630,6 +635,36 @@ static inline uint32_t ROL32(uint32_t val, int n) {
 static inline uint32_t ROR32(uint32_t val, int n) {
     n &= 31;
     return n ? ((val >> n) | (val << (32 - n))) : val;
+}
+
+/* rcl/rcr: rotate through the carry flag.
+ *
+ * The carry is a bit sitting one place above the operand's top bit, so the
+ * rotation is over width+1 bits. That is also why a count is reduced modulo
+ * width+1 for the 8- and 16-bit forms rather than modulo the width: a byte
+ * rotates through nine positions, not eight. The 32-bit form takes the count
+ * masked to five bits and no further, which is already inside 33.
+ *
+ * `cf` carries in and out.
+ */
+static inline uint32_t RC_ROT(uint32_t val, unsigned n, int *cf,
+                              unsigned width, int left) {
+    unsigned mod = width + 1u;
+    uint64_t mask = (width >= 32u) ? 0xFFFFFFFFull
+                                   : ((((uint64_t)1 << width) - 1u));
+    uint64_t x = (((uint64_t)(*cf & 1)) << width) | ((uint64_t)val & mask);
+
+    n &= 31u;
+    if (width < 32u)
+        n %= mod;
+    if (n) {
+        uint64_t full = (((uint64_t)1 << mod) - 1u);
+        x = left ? ((x << n) | (x >> (mod - n)))
+                 : ((x >> n) | (x << (mod - n)));
+        x &= full;
+    }
+    *cf = (int)((x >> width) & 1);
+    return (uint32_t)(x & mask);
 }
 
 static inline uint8_t ROL8(uint8_t val, int n) {

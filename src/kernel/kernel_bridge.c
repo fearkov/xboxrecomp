@@ -145,7 +145,16 @@ static void kernel_data_init(void)
      *   +4: UCHAR GpuRevision
      *   +5: UCHAR McpRevision
      */
-    BRIDGE_MEM32(XBOX_KERNEL_DATA_BASE + KDATA_HARDWARE_INFO + 0) = 0;   /* Retail */
+    {
+        /* Flags. Bit 0 changes how XAPI numbers the controller ports: with it
+         * clear, XAPI walks the root hub of the one OHCI it registers and
+         * calls those two ports 2 and 3, which makes a pad in the first
+         * socket player 3. RECOMP_HW_FLAGS is here to measure which value a
+         * title actually wants rather than to assert one. */
+        const char *f = getenv("RECOMP_HW_FLAGS");
+        BRIDGE_MEM32(XBOX_KERNEL_DATA_BASE + KDATA_HARDWARE_INFO + 0) =
+            f ? (uint32_t)strtoul(f, NULL, 0) : 0u;   /* Retail */
+    }
     BRIDGE_MEM8(XBOX_KERNEL_DATA_BASE + KDATA_HARDWARE_INFO + 4) = 0xA1; /* NV2A A1 */
     BRIDGE_MEM8(XBOX_KERNEL_DATA_BASE + KDATA_HARDWARE_INFO + 5) = 0xB1; /* MCPX B1 */
 
@@ -179,8 +188,48 @@ static void kernel_data_init(void)
      */
     {
         const char *cmdline = getenv("RECOMP_CMDLINE");
+        const char *relaunch = getenv("RECOMP_LAUNCH_DATA");
 
-        if (cmdline && *cmdline) {
+        if (relaunch && *relaunch) {
+            /* This boot is the second half of a title's own reboot.
+             *
+             * A title that calls XLaunchNewImage on itself is not quitting,
+             * it is asking for a cold start with a message left behind --
+             * DDS9 builds its texture-stream cache on Partition5, then
+             * reboots so the next boot can use it. On hardware the launch
+             * data page survives the quick reboot in a reserved physical
+             * page; here the previous process handed it over and this
+             * restores it, which is the same contract.
+             *
+             * Restoring beats re-entering the entry point in-process: the
+             * title expects untouched statics and a fresh heap, and nothing
+             * short of a new process gives it those. */
+            uint32_t page = xbox_HeapAlloc(0x1000 + 0x0C00, 4096);
+            if (page) {
+                size_t i;
+
+                for (i = 0; i < 0x1000; i++) {
+                    char hi = relaunch[i * 2], lo = relaunch[i * 2 + 1];
+                    int v;
+
+                    if (!hi || !lo)
+                        break;
+                    v = ((hi <= '9' ? hi - '0' : (hi | 32) - 'a' + 10) << 4)
+                      |  (lo <= '9' ? lo - '0' : (lo | 32) - 'a' + 10);
+                    BRIDGE_MEM8(page + (uint32_t)i) = (uint8_t)v;
+                }
+                BRIDGE_MEM32(XBOX_KERNEL_DATA_BASE + KDATA_LAUNCH_DATA_PAGE) =
+                    page;
+                fprintf(stderr, "  Launch data: restored %u bytes at 0x%08X"
+                                " (type=%u titleid=0x%08X, relaunch #%s)\n",
+                        (unsigned)i, page, BRIDGE_MEM32(page),
+                        BRIDGE_MEM32(page + 4),
+                        getenv("RECOMP_RELAUNCH_GEN")
+                            ? getenv("RECOMP_RELAUNCH_GEN") : "1");
+            } else {
+                BRIDGE_MEM32(XBOX_KERNEL_DATA_BASE + KDATA_LAUNCH_DATA_PAGE) = 0;
+            }
+        } else if (cmdline && *cmdline) {
             uint32_t page = xbox_HeapAlloc(0x1000 + 0x0C00, 4096);
             if (page) {
                 size_t n = strlen(cmdline);
@@ -233,16 +282,9 @@ static void kernel_data_init(void)
      * "no video mode reported", which titles treat as auto-detect. */
     BRIDGE_MEM32(XBOX_KERNEL_DATA_BASE + KDATA_BOOT_SMC_VIDEO) = 0;
 
-    /* IdexChannelObject is a structure, not an opaque pointer. Guest file-close
-     * code walks DeviceQueue.DeviceListHead at +0x28. Host-backed synchronous
-     * I/O does not enqueue guest IRPs, so this must be an empty circular list.
-     * Reserve separate storage: the old 16-byte slot overlapped the key exports. */
-    {
-        uint32_t channel=XBOX_KERNEL_DATA_BASE + KDATA_IDEX_CHANNEL;
-        memset(XBOX_TO_NATIVE(channel),0,0x200);
-        BRIDGE_MEM32(channel+0x28)=channel+0x28;
-        BRIDGE_MEM32(channel+0x2C)=channel+0x28;
-    }
+    /* IdexChannelObject (ordinal 357) - IDE channel object. Opaque; only ever
+     * passed back to Io* routines we stub, so a recognisable non-null is enough. */
+    BRIDGE_MEM32(XBOX_KERNEL_DATA_BASE + KDATA_IDEX_CHANNEL) = XBOX_KERNEL_DATA_BASE + KDATA_IDEX_CHANNEL;
 
     /* HalDiskCachePartitionCount (ordinal 40) - number of cache partitions.
      * Retail consoles report 3 (X, Y, Z). Titles size a partition array from
@@ -409,6 +451,66 @@ static void bridge_run_thread_inline(recomp_func_t fn, uint32_t ctx1,
     g_esp += 12;
 }
 
+/* Every host thread that executes guest code.
+ *
+ * On the console a deferred routine runs at DISPATCH_LEVEL on the one CPU:
+ * it preempts thread code and the two never execute at the same instant. Here
+ * the timer thread is a real host thread, so a DPC runs genuinely beside the
+ * main thread. Shin Megami Tensei: Nine faults on exactly that -- its timer
+ * DPC sub_0031667F reverses a linked list in guest memory in place, reading
+ * the link at +8 and overwriting it as it walks, while the main thread is
+ * inside the same list.
+ *
+ * Preemption is the semantics to reproduce, and suspending the other guest
+ * threads for the length of the routine reproduces it exactly. Only guest
+ * threads go in here: suspending a host thread inside the CRT would deadlock
+ * the first allocation the routine makes. */
+#define GUEST_THREADS_MAX 32
+static HANDLE g_guest_threads[GUEST_THREADS_MAX];
+static volatile LONG g_guest_thread_count;
+static DWORD g_guest_thread_ids[GUEST_THREADS_MAX];
+
+void xbox_RegisterGuestThread(void)
+{
+    LONG i = InterlockedIncrement(&g_guest_thread_count) - 1;
+    HANDLE dup = NULL;
+
+    if (i >= GUEST_THREADS_MAX)
+        return;
+    if (!DuplicateHandle(GetCurrentProcess(), GetCurrentThread(),
+                         GetCurrentProcess(), &dup,
+                         THREAD_SUSPEND_RESUME, FALSE, 0))
+        return;
+    g_guest_thread_ids[i] = GetCurrentThreadId();
+    g_guest_threads[i] = dup;
+}
+
+/* Suspend/resume every registered guest thread but the caller. Returns the
+ * number suspended, which the resume side needs so a thread that registered
+ * mid-DPC is not resumed without ever having been stopped. */
+static LONG guest_threads_suspend(void)
+{
+    DWORD me = GetCurrentThreadId();
+    LONG n = InterlockedCompareExchange(&g_guest_thread_count, 0, 0);
+    LONG i;
+
+    if (n > GUEST_THREADS_MAX) n = GUEST_THREADS_MAX;
+    for (i = 0; i < n; i++)
+        if (g_guest_threads[i] && g_guest_thread_ids[i] != me)
+            SuspendThread(g_guest_threads[i]);
+    return n;
+}
+
+static void guest_threads_resume(LONG n)
+{
+    DWORD me = GetCurrentThreadId();
+    LONG i;
+
+    for (i = 0; i < n; i++)
+        if (g_guest_threads[i] && g_guest_thread_ids[i] != me)
+            ResumeThread(g_guest_threads[i]);
+}
+
 static DWORD WINAPI bridge_thread_main(LPVOID param)
 {
     struct bridge_thread_start *s = (struct bridge_thread_start *)param;
@@ -422,6 +524,7 @@ static DWORD WINAPI bridge_thread_main(LPVOID param)
      * for every thread, which is how two of them ended up inside _lock() each
      * holding the lock the other wanted. */
     g_is_spawned_thread = 1;
+    xbox_RegisterGuestThread();
     g_esp = s->stack_top;
     g_thread_stack_top = s->stack_top;
     {
@@ -588,6 +691,12 @@ static void bridge_PsCreateSystemThreadEx(void)
  * NTSTATUS NtClose(HANDLE Handle)
  * Handle is a value (not a pointer), so safe for generic call.
  */
+
+/* Asynchronous-handle bookkeeping, defined with the file bridges below. */
+static void bridge_note_async_handle(uint32_t token);
+static void bridge_forget_async_handle(uint32_t token);
+static int  bridge_handle_is_async(uint32_t token);
+
 /* Handle-table helpers; defined further below. Xbox memory slots are 32-bit
  * but native HANDLEs are 64-bit pointers, so handles are kept in a table and
  * referenced by tagged 32-bit tokens. */
@@ -602,6 +711,8 @@ static void bridge_NtClose(void)
         fprintf(stderr, "  [KERNEL] NtClose: handle=0x%08X\n", raw_handle);
         fflush(stderr);
     }
+
+    bridge_forget_async_handle(raw_handle);
 
     /* Close real handles but skip fake/synthetic ones */
     if (raw_handle && raw_handle != 0xDEAD0001u && raw_handle != 0xBEEF0010u) {
@@ -1094,6 +1205,99 @@ static void bridge_ExQueryNonVolatileSetting(void)
  *
  * It never returns on hardware. Returning here would let the game run on past
  * a decision to quit, which reads as a hang rather than an exit. */
+/* Carry out a title's own reboot instead of exiting.
+ *
+ * XLaunchNewImage on hardware is: fill the launch data page, quick-reboot,
+ * and the named image starts with that page intact. When the image named is
+ * the title itself -- empty path, own title id -- the whole point is a cold
+ * start that can see what the previous boot left behind. DDS9 does this after
+ * building its texture cache, and treating it as an exit is why the title
+ * stopped one step short of its menu with no error: it had not failed, it had
+ * asked to be started again.
+ *
+ * A new process rather than a second call to the entry point, because what
+ * the title is asking for is precisely the state a re-entry would not give
+ * it: zeroed statics, an empty heap, and the loader running again.
+ *
+ * Returns 0 if the caller should carry on exiting -- feature off, generation
+ * cap reached, or the relaunch could not be started. Does not return when it
+ * succeeds.
+ */
+static int bridge_relaunch_title(uint32_t page)
+{
+    static const char hex[] = "0123456789abcdef";
+    char *blob;
+    char gen_buf[16];
+    unsigned gen, max;
+    const char *s_gen = getenv("RECOMP_RELAUNCH_GEN");
+    const char *s_max = getenv("RECOMP_RELAUNCH_MAX");
+    char exe[MAX_PATH];
+    STARTUPINFOA si;
+    PROCESS_INFORMATION pi;
+    uint32_t i;
+
+    /* Bounded on purpose. A title whose second boot does not get past the
+     * same check reboots again, and an unbounded loop of 90-second boots is
+     * indistinguishable from a hang while being much harder to read. Four is
+     * enough for the chain DDS9 actually uses; 0 turns the whole thing off. */
+    max = s_max ? (unsigned)atoi(s_max) : 4u;
+    gen = s_gen ? (unsigned)atoi(s_gen) : 0u;
+    if (max == 0)
+        return 0;
+    if (gen >= max) {
+        fprintf(stderr, "  [KERNEL] relaunch #%u refused:"
+                        " RECOMP_RELAUNCH_MAX=%u reached\n", gen + 1, max);
+        return 0;
+    }
+
+    if (!GetModuleFileNameA(NULL, exe, sizeof exe))
+        return 0;
+
+    blob = (char *)malloc(0x1000 * 2 + 1);
+    if (!blob)
+        return 0;
+    for (i = 0; i < 0x1000; i++) {
+        uint8_t b = BRIDGE_MEM8(page + i);
+        blob[i * 2]     = hex[b >> 4];
+        blob[i * 2 + 1] = hex[b & 0xF];
+    }
+    blob[0x1000 * 2] = 0;
+
+    /* Through the environment rather than a file: the page is handed to one
+     * specific child and cannot outlive it, so an unrelated later run can
+     * never pick up a stale reboot message. */
+    sprintf(gen_buf, "%u", gen + 1);
+    if (!SetEnvironmentVariableA("RECOMP_LAUNCH_DATA", blob)
+            || !SetEnvironmentVariableA("RECOMP_RELAUNCH_GEN", gen_buf)) {
+        free(blob);
+        return 0;
+    }
+
+    memset(&si, 0, sizeof si);
+    si.cb = sizeof si;
+    memset(&pi, 0, sizeof pi);
+
+    fprintf(stderr, "  [KERNEL] relaunch #%s: restarting %s"
+                    " with the title's launch data\n", gen_buf, exe);
+    fflush(stderr);
+    fflush(stdout);
+
+    /* Handles inherited so the child keeps writing to the same stdout and
+     * stderr; the log of a reboot chain is one log. */
+    if (!CreateProcessA(exe, GetCommandLineA(), NULL, NULL, TRUE,
+                        0, NULL, NULL, &si, &pi)) {
+        fprintf(stderr, "  [KERNEL] relaunch failed: CreateProcess err=%lu\n",
+                (unsigned long)GetLastError());
+        free(blob);
+        return 0;
+    }
+    CloseHandle(pi.hThread);
+    CloseHandle(pi.hProcess);
+    free(blob);
+    _exit(0);
+    return 1;
+}
+
 static void bridge_HalReturnToFirmware(void)
 {
     uint32_t routine = STACK_ARG(0);
@@ -1182,6 +1386,28 @@ static void bridge_HalReturnToFirmware(void)
                     waited);
     }
 
+    /* Reboot-with-a-message is a relaunch, not an exit. Only for the reboot
+     * routines: routine 0 is a halt and routine 4 is a fatal error, and
+     * restarting either of those would be inventing an intent the title did
+     * not express. */
+    if (routine == 1 || routine == 2) {
+        uint32_t page =
+            BRIDGE_MEM32(XBOX_KERNEL_DATA_BASE + KDATA_LAUNCH_DATA_PAGE);
+
+        /* Only when the page names an image.
+         *
+         * XLaunchNewImage(NULL, data) launches the DASHBOARD, and that is
+         * what an empty path here means -- the title id in the header is the
+         * caller recording itself, not a request to start itself again. The
+         * XAPI startup stub calls XapiBootToDash the moment main() returns,
+         * so every ordinary end-of-title looks exactly like this, and
+         * restarting on it turns "the game finished" into a boot loop. There
+         * is no dashboard to launch, so that case is an exit. */
+        if (page && BRIDGE_MEM8(page + 8) != 0
+                && bridge_relaunch_title(page))
+            return; /* not reached: the helper never returns on success */
+    }
+
     xbox_HalReturnToFirmware(routine);
 }
 
@@ -1218,16 +1444,19 @@ static void bridge_ExAllocatePoolWithTag(void)
 }
 
 /* ── KfRaiseIrql / KfLowerIrql (ordinals 160, 161) ────── */
+/* Both are __fastcall: the new level arrives in ECX and nothing is pushed.
+ * Read off the stack instead and the level is whatever the caller's frame
+ * happened to hold -- 48, 188, 232 were all observed on a real title, none of
+ * them an IRQL. The levels then disagree with each other, so a raise/lower
+ * pair no longer nets out and anything counting them drifts. */
 static void bridge_KfRaiseIrql(void)
 {
-    uint32_t new_irql = g_ecx; /* fastcall: KIRQL is passed in CL */
-    g_eax = (uint32_t)xbox_KfRaiseIrql((UCHAR)new_irql);
+    g_eax = (uint32_t)xbox_KfRaiseIrql((UCHAR)g_ecx);
 }
 
 static void bridge_KfLowerIrql(void)
 {
-    uint32_t new_irql = g_ecx; /* fastcall: KIRQL is passed in CL */
-    xbox_KfLowerIrql((UCHAR)new_irql);
+    xbox_KfLowerIrql((UCHAR)g_ecx);
     g_eax = 0;
 }
 
@@ -1625,12 +1854,10 @@ static void bridge_NtYieldExecution(void)
 static void bridge_MmGetPhysicalAddress(void)
 {
     uint32_t addr = STACK_ARG(0);
-    /* Calls the same xbox_* the thunk table exposes, so there is one
-     * implementation rather than two that have to be kept in agreement.
-     * Note this bridge itself is not covered by any test: bridge functions
-     * are static and driven by guest CPU state, and nothing in tests/ can
-     * reach them. */
-    g_eax = (uint32_t)xbox_MmGetPhysicalAddress((PVOID)(uintptr_t)addr);
+    /* Xbox uses identity mapping (physical == virtual) for the lower 64MB.
+     * Just return the Xbox VA as-is. Don't call xbox_MmGetPhysicalAddress
+     * which would return a native pointer. */
+    g_eax = addr;
 }
 
 /* ── MmSetAddressProtect (ordinal 182) ───────────────────── */
@@ -1779,11 +2006,15 @@ static void bridge_HalReadSMCTrayState(void)
  *
  * Returns 1 if the routine was found and called.
  */
+static int g_dpc_stop_world = -1;
+
 static int kernel_run_dpc(uint32_t dpc_va, uint32_t arg1, uint32_t arg2)
 {
     uint32_t routine, context;
     recomp_func_t fn;
 
+    if (g_dpc_stop_world < 0)
+        g_dpc_stop_world = getenv("RECOMP_DPC_STOPWORLD") != NULL;
     if (!dpc_va)
         return 0;
     routine = BRIDGE_MEM32(dpc_va + 12);
@@ -1800,6 +2031,25 @@ static int kernel_run_dpc(uint32_t dpc_va, uint32_t arg1, uint32_t arg2)
         return 0;
     }
 
+    /* What we are actually about to call, and with what.
+     *
+     * A deferred routine is reached entirely through guest memory: the KDPC
+     * address came from the title, the routine and context are fields inside
+     * it. A stale or wrong KDPC means calling a real function with someone
+     * else's context, which faults deep inside it and looks like the routine
+     * is broken. Print the triple so it can be checked against the register
+     * that set the timer. */
+    if (getenv("RECOMP_DPC_TRACE")) {
+        static unsigned n;
+        if (n++ < 40) {
+            fprintf(stderr, "  [DPC] kdpc=0x%08X routine=0x%08X ctx=0x%08X "
+                    "type=%u num=%u\n", dpc_va, routine, context,
+                    (unsigned)(BRIDGE_MEM32(dpc_va) & 0xFFFF),
+                    (unsigned)((BRIDGE_MEM32(dpc_va) >> 16) & 0xFF));
+            fflush(stderr);
+        }
+    }
+
     BRIDGE_MEM32(dpc_va + 20) = arg1;
     BRIDGE_MEM32(dpc_va + 24) = arg2;
 
@@ -1808,7 +2058,29 @@ static int kernel_run_dpc(uint32_t dpc_va, uint32_t arg1, uint32_t arg2)
     g_esp -= 4; BRIDGE_MEM32(g_esp) = context;
     g_esp -= 4; BRIDGE_MEM32(g_esp) = dpc_va;
     g_esp -= 4; BRIDGE_MEM32(g_esp) = 0;
-    fn();
+
+    if (g_dpc_stop_world) {
+        /* Preemption by suspension. Faithful to the console and unusable
+         * here: a guest thread stopped inside the CRT or the heap still
+         * holds that host lock, and the first allocation the routine makes
+         * waits for it for ever. Measured at 22k kernel calls against 19M
+         * for a run left alone -- it does not crash because it does not
+         * get anywhere. Kept behind the flag as a record of that. */
+        LONG n = guest_threads_suspend();
+        fn();
+        guest_threads_resume(n);
+    } else if (getenv("RECOMP_DISPATCH_LOCK")) {
+        /* Cooperative instead: take the boundary the guest takes when it
+         * raises IRQL. Nothing is suspended, so no host lock can be held by
+         * a stopped thread, and the bound keeps a hung guest from switching
+         * deferred work off. */
+        int got = xbox_DispatchEnterForDpc(200);
+        fn();
+        if (got)
+            xbox_DispatchLeaveForDpc();
+    } else {
+        fn();
+    }
     return 1;
 }
 
@@ -1903,6 +2175,18 @@ static void bridge_KeInsertQueueDpc(void)
         fflush(stderr);
         g_eax = 0;
         return;
+    }
+    if (getenv("RECOMP_DPC_TRACE")) {
+        static unsigned n;
+        if (n++ < 40) {
+            /* DeferredRoutine is at +12; +8 is the Blink of DpcListEntry,
+             * which reads 0 on a DPC that is not queued yet and made every
+             * insertion look like it carried no routine. */
+            fprintf(stderr, "  [DPC] queued kdpc=0x%08X routine 0x%08X "
+                    "(a1=%08X a2=%08X)\n",
+                    dpc, BRIDGE_MEM32(dpc + 12), arg1, arg2);
+            fflush(stderr);
+        }
     }
     g_dpc_queue[tail].dpc  = dpc;
     g_dpc_queue[tail].arg1 = arg1;
@@ -2006,10 +2290,148 @@ static void kernel_vblank_tick(void)
     }
 }
 
+/* The audio processor's interrupt, which nothing was raising.
+ *
+ * `KeConnectInterrupt: vector 5 -> routine 0x002A5E73` happens at startup on
+ * Shin Megami Tensei: Nine and then the line is never asserted, so that ISR
+ * never runs. Following it down:
+ *
+ *     0x002A5E73 -> sub_002A5DD7 -> sub_002A5CBA -> sub_002A5C39
+ *                -> sub_002A55E2 -> sub_002A6C5D -> flags &= 0x7FFF
+ *
+ * which clears bit 15 of a DirectSound object's flag word -- the bit the
+ * title busy-waits on in `sub_002A7B31`:
+ *
+ *     do { check(); } while (flags & 0x8000);
+ *
+ * With no interrupt the only thing that ever clears it is a half-second
+ * timeout, so every audio wait costs the full 500 ms, spinning at
+ * DISPATCH_LEVEL. That starves everything else: the gamepad's periodic
+ * list goes from 99 descriptors a second to zero and does not recover.
+ *
+ * The console raises this when a buffer completes. Raising it on a timer
+ * is not that, but it is the difference between an ISR that runs and one
+ * that never does, and the ISR is what retires the work.
+ */
+#define APU_VECTOR             5u
+extern volatile int g_apu_irq_asserted;   /* src/apu/apu_core.c */
+
+static void kernel_apu_tick(void)
+{
+    static int enabled = -1;
+    static long long next_ms;
+    long long now;
+
+    if (enabled < 0)
+        enabled = getenv("RECOMP_APU_IRQ") != NULL;
+    if (!enabled)
+        return;
+
+    now = (long long)GetTickCount64();
+    if (now < next_ms)
+        return;
+    next_ms = now + 2;                        /* ~500 Hz, a DSP frame */
+
+    if (!xbox_GetConnectedInterrupt(APU_VECTOR))
+        return;
+
+    /* Only while the model says the line is up.
+     *
+     * The status register the ISR reads lives inside the APU model, behind
+     * an unmapped page it traps on -- writing it from here faults. The
+     * model already computes the bit correctly; what it could not do is
+     * deliver, because the ISR is guest code and needs this thread's stack
+     * and TIB. */
+    if (!g_apu_irq_asserted)
+        return;
+
+
+    {
+        static unsigned n;
+        int claimed = kernel_raise_interrupt(APU_VECTOR);
+        if (n++ < 3) {
+            fprintf(stderr, "  [APU] interrupt -> ISR %s\n",
+                    claimed < 0 ? "not callable" :
+                    claimed ? "claimed it" : "declined it");
+            fflush(stderr);
+        }
+    }
+}
+
 /* Run whatever is queued. Called from the timer thread, which has the guest
  * stack and TIB that a deferred routine needs. */
+/* Deferred work and interrupt delivery must stand back while the guest holds
+ * IRQL raised.
+ *
+ * On the console a DPC runs at DISPATCH_LEVEL on the one CPU: it preempts
+ * thread code, and thread code that raises IRQL keeps it out entirely. The
+ * two never execute at the same time. Here the timer thread is a real host
+ * thread, so a DPC runs genuinely beside the main thread and the title's
+ * raise buys it nothing.
+ *
+ * Shin Megami Tensei: Nine faults on exactly that. sub_0031667F is a timer
+ * DPC that reverses a linked list in guest memory in place -- it reads the
+ * link at +8, overwrites it, and walks on -- while the main thread is inside
+ * the same list. The walk picks up a link caught half-written and hands the
+ * node to sub_00316D1B, which dereferences a field of it and dies on a
+ * pointer that was never a pointer. That is the intermittent access
+ * violation, and its address changes with timing because the corruption does.
+ *
+ * Raising IRQL is how the title asks for this exclusion, so honour it here
+ * the way the device models already do -- and bound it for the same reason
+ * theirs is bounded: a title that spins raised must not switch deferred work
+ * off for good. Past the bound the delivery goes through anyway, which is the
+ * behaviour this had everywhere before. */
+#define DPC_HOLDOFF_MS 100
+
+static unsigned g_dpc_deferred;   /* ticks skipped because the guest was raised */
+static unsigned g_dpc_forced;     /* ticks run anyway, past the bound */
+
+static int dpc_holdoff_active(void)
+{
+    static int on = -1;
+    static unsigned long held_since;
+    unsigned long now;
+
+    if (on < 0)
+        on = getenv("RECOMP_DPC_HOLDOFF") != NULL;
+    if (!on)
+        return 0;
+
+    if (!xbox_IrqlBlocksInterrupts()) {
+        held_since = 0;
+        return 0;
+    }
+
+    now = (unsigned long)GetTickCount();
+    if (!held_since)
+        held_since = now;
+    if (now - held_since < DPC_HOLDOFF_MS) {
+        g_dpc_deferred++;
+        return 1;
+    }
+    g_dpc_forced++;
+    return 0;
+}
+
 static void kernel_drain_dpcs(void)
 {
+    /* Deferred routines actually executed, per second. A driver that waits
+     * on an event a completion DPC is meant to signal stops dead if these
+     * stop running, and from outside that looks like the device failing
+     * rather than the queue draining. */
+    if (getenv("RECOMP_DPC_RATE")) {
+        static unsigned long t0;
+        static unsigned n, secs;
+        LONG h = g_dpc_head, t = g_dpc_tail;
+        n += (unsigned)((t - h + XBOX_MAX_PENDING_DPC) % XBOX_MAX_PENDING_DPC);
+        if (!t0) t0 = (unsigned long)GetTickCount();
+        if ((unsigned long)GetTickCount() - t0 >= 1000) {
+            fprintf(stderr, "  [DPCRATE] second %u: %u run\n", ++secs, n);
+            fflush(stderr);
+            n = 0; t0 = (unsigned long)GetTickCount();
+        }
+    }
     while (g_dpc_head != g_dpc_tail) {
         LONG head = g_dpc_head;
         PendingDpc d = g_dpc_queue[head];
@@ -2268,9 +2690,49 @@ static DWORD WINAPI kernel_timer_thread(LPVOID unused)
         int i;
 
         Sleep(10);
+
+        /* Nothing below this delivers into guest code while the guest holds
+         * IRQL raised; vblank and the APU tick run ISRs, and the two calls
+         * after them run deferred routines. */
+        if (dpc_holdoff_active())
+            continue;
+
         kernel_vblank_tick();  /* the GPU's frame clock */
+        kernel_apu_tick();     /* audio completion, before its DPCs */
         kernel_drain_dpcs();   /* deferred work, before due timers */
         now = (long long)GetTickCount64();
+
+        if (getenv("RECOMP_DPC_HOLDOFF_STATS")) {
+            static unsigned long t0;
+            if (!t0) t0 = (unsigned long)GetTickCount();
+            if ((unsigned long)GetTickCount() - t0 >= 1000) {
+                static int prev_tr;
+                int tr = xbox_IrqlTransitions();
+                fprintf(stderr, "  [DPCHOLD] deferred=%u forced=%u "
+                        "depth=%d transitions/s=%d\n",
+                        g_dpc_deferred, g_dpc_forced,
+                        xbox_IrqlRaisedCount(), tr - prev_tr);
+                fprintf(stderr, "  [DPCLOCK] contended=%d dpc_timeouts=%d "
+                        "guest_timeouts=%d\n", xbox_DispatchContended(),
+                        xbox_DispatchTimeouts(1), xbox_DispatchTimeouts(0));
+                {
+                    /* A depth that is up while nothing moves is stuck, not
+                     * busy. Say who, once. */
+                    static int frozen, dumped;
+                    if (xbox_IrqlRaisedCount() > 0 && tr == prev_tr) {
+                        if (++frozen >= 1 && !dumped) {
+                            dumped = 1;
+                            xbox_IrqlDumpHolders();
+                        }
+                    } else {
+                        frozen = 0;
+                    }
+                }
+                prev_tr = tr;
+                fflush(stderr);
+                t0 = (unsigned long)GetTickCount();
+            }
+        }
 
         for (i = 0; i < XBOX_MAX_TIMERS; i++) {
             uint32_t dpc, fired_va;
@@ -2406,21 +2868,16 @@ static void bridge_RtlNtStatusToDosError(void)
     case 0xC0000008: g_eax = 6; break;          /* STATUS_INVALID_HANDLE → ERROR_INVALID_HANDLE */
     case 0xC0000017: g_eax = 8; break;          /* STATUS_NO_MEMORY → ERROR_NOT_ENOUGH_MEMORY */
     case 0xC000000D: g_eax = 87; break;         /* STATUS_INVALID_PARAMETER → ERROR_INVALID_PARAMETER */
-    /* The informational and warning codes, which are not failures and must
-     * not fall through to the generic answer.
+
+    /* The informational codes, which are not failures and must not fall
+     * through to the generic answer.
      *
-     * 317 is ERROR_MR_MID_NOT_FOUND -- "there is no message text for this
-     * number" -- and as a default for a status nobody has mapped yet it is
-     * honest. As an answer to "is this request still in flight?" it is not:
-     * a caller comparing against ERROR_IO_PENDING gets "no" and takes the
-     * branch for a request that never started.
-     *
-     * Shin Megami Tensei: Nine does exactly that. Its resource loader issues
-     * a read, sees the call fail, asks for the error, and marks the object as
-     * loading only when the answer is ERROR_IO_PENDING. With 317 the object
-     * stayed idle, the poll that finishes the load returned "not started" on
-     * every frame, and the title sat in its first boot state forever with
-     * everything else working. */
+     * 317 is ERROR_MR_MID_NOT_FOUND -- "no message text for this number" --
+     * and it is what Windows gives for a status it cannot name. As a default
+     * it is honest, but a caller that asks "is this in flight?" gets "no",
+     * because 317 is not ERROR_IO_PENDING. Shin Megami Tensei: Nine asks
+     * exactly that after starting the read for its title screen, and took the
+     * wrong branch for the rest of the run. */
     case 0x00000103: g_eax = 997; break;        /* STATUS_PENDING → ERROR_IO_PENDING */
     case 0x00000102: g_eax = 1460; break;       /* STATUS_TIMEOUT → ERROR_TIMEOUT */
     case 0x00000104: g_eax = 0; break;          /* STATUS_REPARSE → ERROR_SUCCESS */
@@ -2467,14 +2924,7 @@ static const char* bridge_get_xbox_path(uint32_t obj_attrs_va)
     if (!ansi_str_va) return NULL;
     buf_va = BRIDGE_MEM32(ansi_str_va + 4);
     if (!buf_va) return NULL;
-    /* XDK directory searches pass a counted prefix of "directory\\*".
-     * The byte after Length need not be NUL or part of the object name. */
-    static RECOMP_TLS char path[65536];
-    uint16_t length=BRIDGE_MEM16(ansi_str_va);
-    if(length>BRIDGE_MEM16(ansi_str_va+2)) return NULL;
-    memcpy(path,XBOX_TO_NATIVE(buf_va),length);
-    path[length]='\0';
-    return path;
+    return (const char*)XBOX_TO_NATIVE(buf_va);
 }
 
 /* Write NTSTATUS + Information into Xbox IO_STATUS_BLOCK */
@@ -2578,9 +3028,7 @@ static void bridge_build_oa(uint32_t obj_attrs_va,
     name->Buffer        = (PCHAR)path;
     name->Length        = path ? (USHORT)strlen(path) : 0;
     name->MaximumLength = (USHORT)(name->Length + 1);
-    uint32_t root = obj_attrs_va ? BRIDGE_MEM32(obj_attrs_va) : 0;
-    /* -3 is the XDK DOS-device namespace, not a file handle. */
-    oa->RootDirectory = root && root != 0xFFFFFFFDu ? bridge_resolve_handle(root) : NULL;
+    oa->RootDirectory = NULL;
     oa->ObjectName    = name;
     oa->Attributes    = 0;
 }
@@ -2750,6 +3198,11 @@ static void bridge_NtCreateFile(void)
     g_eax = (uint32_t)bridge_create_file_impl(
         handle_va, access, obj_attrs, iostatus,
         file_attrs, share, disposition, options);
+
+    /* FILE_SYNCHRONOUS_IO_ALERT | FILE_SYNCHRONOUS_IO_NONALERT. Neither set
+     * means the caller wants asynchronous completion on this handle. */
+    if (g_eax == 0 && handle_va && (options & 0x30u) == 0u)
+        bridge_note_async_handle(BRIDGE_MEM32(handle_va));
 
     /* An FMV the host can decode itself.
      *
@@ -3023,6 +3476,63 @@ static void bridge_RtlUnwind(void)
         g_esp += 0x50;
 }
 
+
+/* Which open file handles were asked for asynchronously.
+ *
+ * NtCreateFile takes FILE_SYNCHRONOUS_IO_ALERT (0x10) and
+ * FILE_SYNCHRONOUS_IO_NONALERT (0x20) in CreateOptions. With neither, the
+ * handle is asynchronous and NtReadFile on it returns STATUS_PENDING even
+ * with no event: the caller is told the request is in flight and waits on
+ * the handle. Completing every read synchronously answers a different
+ * question than the one that was asked, and a title written against the real
+ * contract reads the answer as "nothing started".
+ *
+ * A flat array because a title has a handful of files open at once and a
+ * linear scan of sixty-four entries costs less than the hash would.
+ */
+#define BRIDGE_ASYNC_MAX 64
+static uint32_t g_async_handles[BRIDGE_ASYNC_MAX];
+
+static void bridge_note_async_handle(uint32_t token)
+{
+    int i;
+    if (!token)
+        return;
+    for (i = 0; i < BRIDGE_ASYNC_MAX; i++)
+        if (g_async_handles[i] == token)
+            return;
+    for (i = 0; i < BRIDGE_ASYNC_MAX; i++)
+        if (!g_async_handles[i]) { g_async_handles[i] = token; return; }
+}
+
+static void bridge_forget_async_handle(uint32_t token)
+{
+    int i;
+    for (i = 0; i < BRIDGE_ASYNC_MAX; i++)
+        if (g_async_handles[i] == token) { g_async_handles[i] = 0; return; }
+}
+
+static int bridge_handle_is_async(uint32_t token)
+{
+    int i;
+    if (!token)
+        return 0;
+    for (i = 0; i < BRIDGE_ASYNC_MAX; i++)
+        if (g_async_handles[i] == token)
+            return 1;
+    return 0;
+}
+
+/* Off unless RECOMP_ASYNC_IO is set, so the change can be measured against
+ * the behaviour it replaces rather than swapped in blind. */
+static int bridge_async_io_enabled(void)
+{
+    static int on = -1;
+    if (on < 0)
+        on = getenv("RECOMP_ASYNC_IO") ? 1 : 0;
+    return on;
+}
+
 /* ── NtReadFile (ordinal 219, 8 args = 32 bytes) ──────── */
 static void bridge_NtReadFile(void)
 {
@@ -3056,13 +3566,15 @@ static void bridge_NtReadFile(void)
          * early looks identical to one that never started -- until you can
          * see where each one landed. */
         if (poff)
-            fprintf(stderr, "  [READ] @%lld want=%u got=%u st=0x%08X  %02X %02X %02X %02X\n",
+            fprintf(stderr, "  [READ] from=0x%08X ev=%08X apc=%08X @%lld want=%u got=%u st=0x%08X  %02X %02X %02X %02X\n",
+                    g_xbox_kernel_caller, STACK_ARG(1), STACK_ARG(2),
                     (long long)off.QuadPart, length, got,
                     (uint32_t)ios.Status,
                     got > 0 ? p[0] : 0, got > 1 ? p[1] : 0,
                     got > 2 ? p[2] : 0, got > 3 ? p[3] : 0);
         else
-            fprintf(stderr, "  [READ] @seq want=%u got=%u st=0x%08X  %02X %02X %02X %02X\n",
+            fprintf(stderr, "  [READ] from=0x%08X @seq want=%u got=%u st=0x%08X  %02X %02X %02X %02X\n",
+                    g_xbox_kernel_caller,
                     length, got, (uint32_t)ios.Status,
                     got > 0 ? p[0] : 0, got > 1 ? p[1] : 0,
                     got > 2 ? p[2] : 0, got > 3 ? p[3] : 0);
@@ -3071,6 +3583,30 @@ static void bridge_NtReadFile(void)
     bridge_write_iostatus(iostatus, ios.Status, (uint32_t)ios.Information);
     bridge_complete_file_io(STACK_ARG(1), STACK_ARG(2), STACK_ARG(3),
                             iostatus);
+
+    /* An asynchronous request returns STATUS_PENDING, even when the data was
+     * already there.
+     *
+     * A caller that passes an event or an APC routine is asking to be told
+     * later, and on Windows it is: the read returns 0x00000103 and the status
+     * block carries the result once the event signals. Returning
+     * STATUS_SUCCESS instead is not a harmless shortcut -- it is a different
+     * contract, and code written for the real one takes the branch that says
+     * "nothing is in flight".
+     *
+     * Shin Megami Tensei: Nine reads its title screen this way. Its resource
+     * object marks itself busy only on the pending path, so with a synchronous
+     * answer the object never entered the loading state, the poll that
+     * finishes the load returned "not started" forever, and the title sat on a
+     * black screen in boot state 0 with everything else working.
+     *
+     * The read itself stays synchronous here: the event is already signalled
+     * and the status block already written, so a caller that waits is
+     * satisfied immediately. Only the answer changes. */
+    if (STACK_ARG(1) || STACK_ARG(2)
+            || (bridge_async_io_enabled()
+                && bridge_handle_is_async(STACK_ARG(0))))
+        g_eax = STATUS_PENDING;
 }
 
 /* ── NtWriteFile (ordinal 236, 8 args = 32 bytes) ─────── */
@@ -3186,16 +3722,15 @@ static void bridge_NtDeleteFile(void)
     g_eax = (uint32_t)xbox_NtDeleteFile(&oa);
 }
 
-/* ── NtQueryDirectoryFile (ordinal 207, 10 args = 40 bytes) ─ */
+/* ── NtQueryDirectoryFile (ordinal 207, 9 args = 36 bytes) ─ */
 static void bridge_NtQueryDirectoryFile(void)
 {
     HANDLE   handle      = bridge_resolve_handle(STACK_ARG(0));
     uint32_t ios_va      = STACK_ARG(4);
     uint32_t info_va     = STACK_ARG(5);
     uint32_t length      = STACK_ARG(6);
-    uint32_t info_class  = STACK_ARG(7);
-    uint32_t filename_va = STACK_ARG(8);  /* PXBOX_ANSI_STRING */
-    uint32_t restart     = STACK_ARG(9);  /* BOOLEAN */
+    uint32_t filename_va = STACK_ARG(7);  /* PXBOX_ANSI_STRING */
+    uint32_t restart     = STACK_ARG(8);  /* BOOLEAN */
     XBOX_IO_STATUS_BLOCK ios;
     XBOX_ANSI_STRING     fn;
     PXBOX_ANSI_STRING    pfn = NULL;
@@ -3210,8 +3745,7 @@ static void bridge_NtQueryDirectoryFile(void)
         if (fn.Buffer) pfn = &fn;
     }
     g_eax = (uint32_t)xbox_NtQueryDirectoryFile(handle, NULL, NULL, NULL, &ios,
-                XBOX_TO_NATIVE(info_va), length, (XBOX_FILE_INFORMATION_CLASS)info_class,
-                pfn, (BOOLEAN)restart);
+                XBOX_TO_NATIVE(info_va), length, pfn, (BOOLEAN)restart);
     bridge_write_iostatus(ios_va, ios.Status, (uint32_t)ios.Information);
 }
 
@@ -7925,7 +8459,7 @@ static int stdcall_args_for_ordinal(ULONG ordinal)
     case 204: return 16;  /* NtProtectVirtualMemory (4) */
     case 205: return  8;  /* NtPulseEvent (2) */
     case 206: return 20;  /* NtQueueApcThread (5) */
-    case 207: return 40;  /* NtQueryDirectoryFile (10) */
+    case 207: return 36;  /* NtQueryDirectoryFile (9) */
     case 210: return  8;  /* NtQueryFullAttributesFile (2) */
     case 211: return 20;  /* NtQueryInformationFile (5) */
     case 215: return 12;  /* NtQuerySymbolicLinkObject (3) */
@@ -8809,7 +9343,7 @@ static void kernel_watch_arm_once(void)
 }
 
 /* Current dispatching slot */
-static RECOMP_TLS int g_kernel_dispatch_slot = -1;
+static int g_kernel_dispatch_slot = -1;
 
 static void kernel_thunk_dispatch(void)
 {
@@ -8830,6 +9364,43 @@ static void kernel_thunk_dispatch(void)
     g_kernel_call_count++;
     if (ordinal < XBOX_KERNEL_THUNK_TABLE_SIZE)
         g_ordinal_calls[ordinal]++;
+
+    /* RECOMP_ORD_CALLER=<n> -- who calls one ordinal, by return address.
+     *
+     * A histogram says a title called something twelve million times; it
+     * does not say from where, and those are very different questions when
+     * the answer is a single spin. Counting return addresses turns it into
+     * a named call site. */
+    {
+        static int want = -2;
+        if (want == -2) {
+            const char *e = getenv("RECOMP_ORD_CALLER");
+            want = e ? atoi(e) : -1;
+        }
+        if (want >= 0 && ordinal == (unsigned)want && g_esp) {
+            static uint32_t site[8];
+            static unsigned hits[8];
+            static unsigned n, reported;
+            uint32_t ret = BRIDGE_MEM32(g_esp);
+            unsigned i;
+            for (i = 0; i < 8 && site[i]; i++)
+                if (site[i] == ret) { hits[i]++; break; }
+            if (i < 8 && !site[i]) { site[i] = ret; hits[i] = 1; }
+            if (++n % 300000u == 0u && reported < 6) {
+                reported++;
+                /* `this` as well as the site. A spin on one call site is a
+                 * spin on one object, and the object is what has to be
+                 * watched next -- its address is in ecx/esi at the call,
+                 * and nothing downstream can recover it. */
+                fprintf(stderr, "  [ORDCALL] ordinal %u, %u calls, "
+                        "ecx=%08X esi=%08X, sites:", ordinal, n, g_ecx, g_esi);
+                for (i = 0; i < 8 && site[i]; i++)
+                    fprintf(stderr, " %08X x%u", site[i], hits[i]);
+                fprintf(stderr, "\n");
+                fflush(stderr);
+            }
+        }
+    }
 
     if (KERNEL_LOG_ON()) {
         /* The guest return address sits at the top of the guest stack: the

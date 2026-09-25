@@ -133,6 +133,18 @@ static int surface_write_refused(uint32_t base, uint32_t bytes, const char *what
 }
 
 /* NV097 methods this executor acts on. */
+/* Blending. The title draws its interface with the classic pair, measured
+ * from its own pushbuffer: BLEND_ENABLE set 1168 times and left on,
+ * SFACTOR 0x0302 (SRC_ALPHA) and DFACTOR 0x0303 (ONE_MINUS_SRC_ALPHA). The
+ * font is a DXT3 atlas whose glyph shape lives in the alpha channel, so
+ * ignoring alpha does not merely lose the fade -- it paints the atlas's
+ * opaque background over the interface and the letters vanish. */
+#define NV097_SET_BLEND_ENABLE            0x0304
+#define NV097_SET_BLEND_FUNC_SFACTOR      0x0344
+#define NV097_SET_BLEND_FUNC_DFACTOR      0x0348
+#define NV_BLEND_SRC_ALPHA                0x0302
+#define NV_BLEND_ONE_MINUS_SRC_ALPHA      0x0303
+
 #define NV097_SET_SURFACE_CLIP_HORIZONTAL 0x0200
 #define NV097_SET_SURFACE_CLIP_VERTICAL   0x0204
 #define NV097_SET_SURFACE_FORMAT          0x0208
@@ -248,12 +260,18 @@ static struct {
     uint32_t clip_x, clip_w, clip_y, clip_h;
     uint32_t clear_color;
     uint32_t clears, unhandled_total;
+    /* NV097_SET_TRANSFORM_EXECUTION_MODE (0x1E94): bits 0-1 pick the path,
+     * 0 fixed function and 2 the vertex program. */
+    uint32_t xform_mode;
     uint32_t flip_read, flip_write, flip_modulo, flips;
     uint32_t tris_drawn, tris_skipped_offscreen, batches_untransformed;
     /* Why a batch came out flat. "Untextured" has two causes that look
      * identical on screen and want opposite fixes: the batch carried no
      * texture coordinates, or it did and the stage was not usable. */
-    uint32_t batches_textured, batches_no_uv, batches_no_tex;
+    uint32_t batches_textured, batches_no_uv, batches_no_tex, batches_uv_from_vp;
+    uint32_t blend_enable, blend_sfactor, blend_dfactor;
+    uint32_t inline_short;
+    uint32_t inline_dropped;
     Texture  tex;
 } s_gpu;
 
@@ -312,16 +330,77 @@ static int s_tex_use_count;
 /* Defined below, next to the sampler it goes through. */
 static void dump_texture_bmp(uint32_t seq);
 
+/* See the pixel trace: printing from the rasteriser is expensive enough
+ * to change what the title does, so the trace stays off until the screen
+ * that needs it is reached. */
+static int s_pixa_armed;
+
+/* Environment switches consulted per triangle.
+ *
+ * getenv scans the whole environment on every call, and this file made six
+ * of them for every triangle it drew -- hundreds of thousands of scans a
+ * second at this title's rate. That is not free: the runs where these
+ * accumulated stalled before the title screen appeared, while the same
+ * build without them reached the third menu. An instrument that changes
+ * what it measures is worse than no instrument.
+ *
+ * Resolved once. A switch that is flipped mid-run does not take effect,
+ * which is the right trade for a debugging aid. */
+static const char *pb_env(const char *name, int slot)
+{
+    static const char *cache[8];
+    static unsigned char known;
+    if (!(known & (1u << slot))) {
+        known |= (unsigned char)(1u << slot);
+        cache[slot] = getenv(name);
+    }
+    return cache[slot];
+}
+
+#define PB_ENV_OT0        pb_env("RECOMP_OT0_TRACE",   0)
+#define PB_ENV_VP_VIEWPT  pb_env("RECOMP_VP_VIEWPORT", 1)
+#define PB_ENV_VP_UV      pb_env("RECOMP_VP_UV",       2)
+#define PB_ENV_WILD       pb_env("RECOMP_WILD_TRACE",  3)
+#define PB_ENV_PIXEL      pb_env("RECOMP_PIXEL_TRACE", 4)
+#define PB_ENV_PIXEL_ALL  pb_env("RECOMP_PIXEL_ALL",   5)
+#define PB_ENV_CELL       pb_env("RECOMP_CELL_TRACE",  6)
+
 static void note_texture_use(void)
 {
     int i;
 
     if (!s_gpu.tex.valid)
         return;
+    if (d3d8_format_dxt_block_bytes(s_gpu.tex.color) && !s_pixa_armed) {
+        s_pixa_armed = 1;
+        fprintf(stderr, "  [PIXA] armed: first DXT3 texture bound "
+                        "(0x%08X)\n", s_gpu.tex.offset);
+        fflush(stderr);
+    }
     for (i = 0; i < s_tex_use_count; i++) {
         if (s_tex_use[i].offset == s_gpu.tex.offset
          && s_tex_use[i].color  == s_gpu.tex.color) {
             s_tex_use[i].batches++;
+            /* Repeat dumps of a surface that is redrawn, every Nth bind.
+             *
+             * First use alone cannot tell a spatial decode error from one
+             * that accumulates: a block transform that is wrong is wrong in
+             * every frame on its own, while motion compensation that is
+             * wrong starts from a clean keyframe and smears further with
+             * every predicted frame after it. Identical in one frame,
+             * nothing alike in a sequence -- and a video surface is only
+             * ever seen again here, never for the first time, so this
+             * belongs on this side of the return. */
+            {
+                static int every = -1;
+                static unsigned binds, seq;
+                if (every < 0) {
+                    const char *e = getenv("RECOMP_TEX_DUMP_EVERY");
+                    every = e ? atoi(e) : 0;
+                }
+                if (every > 0 && ++binds % (unsigned)every == 0 && seq < 40)
+                    dump_texture_bmp(1000u + seq++);
+            }
             return;
         }
     }
@@ -334,6 +413,7 @@ static void note_texture_use(void)
         s_tex_use_count++;
         dump_texture_bmp((uint32_t)s_tex_use_count - 1);
     }
+
 }
 
 static void note_unhandled(uint32_t method, uint32_t param)
@@ -356,6 +436,18 @@ static void note_unhandled(uint32_t method, uint32_t param)
     }
 }
 
+/* Bytes one vertex of this attribute occupies. D3DCOLOR is a packed DWORD
+ * whatever its size field says; the other two are size components wide. */
+static size_t attr_bytes(const VertexAttr *a)
+{
+    switch (a->type) {
+    case 0:  return 4;                       /* D3DCOLOR */
+    case 2:  return (size_t)a->size * 4;     /* float */
+    case 4:  return (size_t)a->size;         /* unsigned byte, normalised */
+    default: return 0;
+    }
+}
+
 /* Read attribute `a` of vertex `index` as floats. Only the float and the
  * normalised-byte types appear in practice; anything else returns 0 so a
  * caller sees a degenerate vertex rather than reading past the array. */
@@ -375,8 +467,16 @@ static int fetch_attr(const VertexAttr *a, uint32_t index, float out[4])
          * one there, which is why the offset test is on the other side of this
          * branch. */
         size_t at = (size_t)a->offset + (size_t)index * a->stride;
-        if (at + 4 > (size_t)s_gpu.inline_count * 4)
+        /* How many bytes this attribute occupies, not four. A four-float
+         * position is sixteen, and checking only the first four lets a
+         * vertex that ends inside the payload read past it -- garbage
+         * coordinates from whatever the buffer held last, out of the end of
+         * a static array. */
+        size_t need = attr_bytes(a);
+        if (!need || at + need > (size_t)s_gpu.inline_count * 4) {
+            s_gpu.inline_short++;
             return 0;
+        }
         p = (const uint8_t *)s_gpu.inline_buf + at;
     } else {
         if (!a->offset)
@@ -497,6 +597,28 @@ static void dump_surface_bmp(void)
 
 /* Defined below, next to the rest of the rasteriser; the clear path uses it
  * for RECOMP_RASTER_TEST. */
+static unsigned long s_px_written;
+
+/* Distinct pixels a batch touches, as opposed to writes it makes. Two
+ * triangles that overlap make two writes to one pixel, so a write count
+ * cannot tell a quad that covers its rectangle from one that covers three
+ * quarters of it twice. A stamp carrying the batch number can. */
+static uint32_t s_cover_stamp[640 * 480];
+static uint32_t s_cover_batch;
+
+static int s_cover_on = -1;
+
+static void cover_mark(int x, int y)
+{
+    if (!s_cover_on)
+        return;
+    if ((unsigned)x < 640 && (unsigned)y < 480
+        && s_cover_stamp[y * 640 + x] != s_cover_batch) {
+        s_cover_stamp[y * 640 + x] = s_cover_batch;
+        s_px_written++;
+    }
+}
+
 static void raster_triangle(const float a[2], const float b[2],
                             const float c[2], uint32_t argb,
                             const float uv[3][2]);
@@ -597,7 +719,11 @@ static void clear_surface(uint32_t param)
      * would show the one nothing is writing. */
     /* The window has to read where the pixels actually are, which is the
      * resolved address rather than the DMA-object offset. */
-    xbox_FramebufferWindowSet(dma_resolve(s_gpu.color_offset), s_gpu.pitch);
+    /* Only until the title flips: following the draw surface every scan
+     * shows the buffer being written right now, half a frame at a time. Past
+     * the first flip the window is repointed there instead. */
+    if (s_gpu.flips == 0)
+        xbox_FramebufferWindowSet(dma_resolve(s_gpu.color_offset), s_gpu.pitch);
 
     /* And open the window, rather than waiting for AvSetDisplayMode to do it.
      *
@@ -797,6 +923,35 @@ static int sample_texture(uint32_t u, uint32_t v, uint32_t *argb)
         *argb = ((uint32_t)p[u] << 24) | 0x00FFFFFFu;
         return 1;
 
+    /* 4:2:2 packed YUV, two texels per four bytes. This is how the title
+     * hands over a decoded video frame -- a 640x480 linear surface of format
+     * 0x24 -- and without it the frame falls through to the flat colour of
+     * the quad, which is why the movie was a blank rectangle.
+     *
+     * The chroma pair is shared between the even texel and the one after it,
+     * so the group is found by masking the bottom bit of u. BT.601, the same
+     * coefficients the D3D8 upload path converts with, so both agree. */
+    case 0x24:                                      /* LC_CR8YB8CB8YA8, YUY2 */
+    case 0x25: {                                    /* LC_YB8CR8YA8CB8, UYVY */
+        uint32_t yoff = (fmt == 0x24) ? 0u : 1u;
+        const uint8_t *g = p + (size_t)(u & ~1u) * 2;
+        int c  = (int)g[(u & 1u) ? 2 + yoff : yoff] - 16;
+        int cu = (int)g[1 - yoff] - 128;
+        int cv = (int)g[3 - yoff] - 128;
+        int r = (298 * c + 409 * cv + 128) >> 8;
+        int gg = (298 * c - 100 * cu - 208 * cv + 128) >> 8;
+        int b = (298 * c + 516 * cu + 128) >> 8;
+        if (r < 0) r = 0;
+        if (r > 255) r = 255;
+        if (gg < 0) gg = 0;
+        if (gg > 255) gg = 255;
+        if (b < 0) b = 0;
+        if (b > 255) b = 255;
+        *argb = 0xFF000000u | ((uint32_t)r << 16) | ((uint32_t)gg << 8)
+              | (uint32_t)b;
+        return 1;
+    }
+
     default:
         return 0;
     }
@@ -904,6 +1059,43 @@ static void put_pixel(uint8_t *mem, uint32_t bpp, int x, int y, uint32_t argb)
     if ((argb & 0x00FFFFFFu) > (s_gpu.pixel_max & 0x00FFFFFFu))
         s_gpu.pixel_max = argb;
     row = s_surface + (size_t)y * s_gpu.pitch;
+
+    /* src*srcAlpha + dst*(1-srcAlpha), and only that pair.
+     *
+     * Any other factor combination falls through to an opaque write rather
+     * than being approximated: a wrong blend is harder to recognise on
+     * screen than no blend, and this is the only pair this title sets.
+     *
+     * Fully opaque is left alone deliberately. It is the same arithmetic,
+     * but skipping it keeps the full-screen quads -- which are drawn with
+     * blending enabled and alpha 255 -- on exactly the path they were on
+     * before, so this cannot change what they produce. */
+    if (s_gpu.blend_enable
+        && s_gpu.blend_sfactor == NV_BLEND_SRC_ALPHA
+        && s_gpu.blend_dfactor == NV_BLEND_ONE_MINUS_SRC_ALPHA
+        && (argb >> 24) != 0xFF) {
+        uint32_t sa = argb >> 24;
+        uint32_t dst = 0;
+        if (bpp == 4) {
+            dst = ((const uint32_t *)row)[x];
+        } else if (bpp == 2) {
+            uint32_t t = ((const uint16_t *)row)[x];
+            dst = (((t & 0xF800u) << 8) | ((t & 0x07E0u) << 5)
+                 | ((t & 0x001Fu) << 3));
+        }
+        if (sa == 0)
+            return;                        /* nothing of the source survives */
+        {
+            uint32_t r = (((argb >> 16) & 0xFF) * sa
+                        + ((dst >> 16) & 0xFF) * (255u - sa) + 127u) / 255u;
+            uint32_t g = (((argb >>  8) & 0xFF) * sa
+                        + ((dst >>  8) & 0xFF) * (255u - sa) + 127u) / 255u;
+            uint32_t b = (((argb      ) & 0xFF) * sa
+                        + ((dst      ) & 0xFF) * (255u - sa) + 127u) / 255u;
+            argb = 0xFF000000u | (r << 16) | (g << 8) | b;
+        }
+    }
+
     if (bpp == 4) {
         ((uint32_t *)row)[x] = argb;
     } else if (bpp == 2) {
@@ -913,6 +1105,219 @@ static void put_pixel(uint8_t *mem, uint32_t bpp, int x, int y, uint32_t argb)
     }
 }
 
+/* ---- The NV2A vertex program ------------------------------------------
+ *
+ * Shin Megami Tensei: Nine submits every one of its draws through the
+ * programmable transform path -- measured, 28686 of 28686 batches report
+ * SET_TRANSFORM_EXECUTION_MODE mode 2, and it never uploads a fixed-function
+ * matrix. The vertices in its arrays are therefore model space, and the
+ * position each draw actually wants is built by the program from constants
+ * the title rewrites before every draw. Using the array positions directly
+ * put every glyph of a keyboard at one place.
+ *
+ * The encoding below is taken from xemu's field table
+ * (hw/xbox/nv2a/pgraph/glsl/vsh-prog.c) rather than recalled: an instruction
+ * is four little-endian dwords, dword 0 unused, and every field is a
+ * (dword, start bit, width) triple.
+ */
+#define VP_MAX_SLOTS   136
+#define VP_MAX_CONSTS   192
+
+typedef struct { uint8_t dw, bit, len; } VpField;
+
+/* Order matches VpFieldName below. */
+static const VpField VP_FIELDS[] = {
+    {1, 25, 3}, {1, 21, 4}, {1, 13, 8}, {1,  9, 4},     /* ILU MAC CONST V  */
+    {1,  8, 1}, {1,  6, 2}, {1,  4, 2}, {1,  2, 2},     /* A neg, swz x y z */
+    {1,  0, 2}, {2, 28, 4}, {2, 26, 2},                 /* A swz w, reg, mux*/
+    {2, 25, 1}, {2, 23, 2}, {2, 21, 2}, {2, 19, 2},     /* B neg, swz x y z */
+    {2, 17, 2}, {2, 13, 4}, {2, 11, 2},                 /* B swz w, reg, mux*/
+    {2, 10, 1}, {2,  8, 2}, {2,  6, 2}, {2,  4, 2},     /* C neg, swz x y z */
+    {2,  2, 2}, {2,  0, 2}, {3, 30, 2}, {3, 28, 2},     /* C swz w, hi,lo,mux*/
+    {3, 24, 4}, {3, 20, 4}, {3, 16, 4}, {3, 12, 4},     /* out mac mask, R, ilu mask, o mask */
+    {3, 11, 1}, {3,  3, 8}, {3,  2, 1}, {3,  1, 1},     /* orb, address, mux, a0x */
+    {3,  0, 1},                                         /* final            */
+};
+
+enum VpFieldName {
+    VP_ILU, VP_MAC, VP_CONST, VP_V,
+    VP_A_NEG, VP_A_SWZ_X, VP_A_SWZ_Y, VP_A_SWZ_Z, VP_A_SWZ_W, VP_A_R, VP_A_MUX,
+    VP_B_NEG, VP_B_SWZ_X, VP_B_SWZ_Y, VP_B_SWZ_Z, VP_B_SWZ_W, VP_B_R, VP_B_MUX,
+    VP_C_NEG, VP_C_SWZ_X, VP_C_SWZ_Y, VP_C_SWZ_Z, VP_C_SWZ_W,
+    VP_C_R_HIGH, VP_C_R_LOW, VP_C_MUX,
+    VP_OUT_MAC_MASK, VP_OUT_R, VP_OUT_ILU_MASK, VP_OUT_O_MASK,
+    VP_OUT_ORB, VP_OUT_ADDRESS, VP_OUT_MUX, VP_A0X, VP_FINAL
+};
+
+/* PARAM_R = 1, PARAM_V = 2, PARAM_C = 3; OMUX_MAC = 0, OMUX_ILU = 1. */
+#define VP_PARAM_R 1u
+#define VP_PARAM_V 2u
+#define VP_PARAM_C 3u
+
+static uint32_t s_vp_prog[VP_MAX_SLOTS][4];
+static uint32_t s_vp_prog_len;
+static float    s_vp_const[VP_MAX_CONSTS][4];
+static uint32_t s_vp_prog_load, s_vp_prog_dw;
+static uint32_t s_vp_const_load, s_vp_const_dw;
+static float    s_vp_viewport_off[4], s_vp_viewport_scale[4];
+static int      s_vp_have_viewport;
+static int      s_vp_on = -1;   /* RECOMP_NO_VP turns it off */
+
+static uint32_t vp_field(const uint32_t *t, enum VpFieldName f)
+{
+    const VpField *m = &VP_FIELDS[f];
+    return (t[m->dw] >> m->bit) & ~(0xFFFFFFFFu << m->len);
+}
+
+static void vp_load_program_word(uint32_t param)
+{
+    uint32_t slot = s_vp_prog_load + s_vp_prog_dw / 4u;
+
+    if (slot < VP_MAX_SLOTS) {
+        s_vp_prog[slot][s_vp_prog_dw % 4u] = param;
+        if (slot + 1u > s_vp_prog_len)
+            s_vp_prog_len = slot + 1u;
+    }
+    s_vp_prog_dw++;
+}
+
+static void vp_load_constant_word(uint32_t param)
+{
+    uint32_t idx = s_vp_const_load + s_vp_const_dw / 4u;
+
+    if (idx < VP_MAX_CONSTS)
+        memcpy(&s_vp_const[idx][s_vp_const_dw % 4u], &param, 4);
+    s_vp_const_dw++;
+}
+
+/* One source operand: pick the register file, swizzle, negate. */
+static void vp_read_src(const uint32_t *t, int which,
+                        const float v[16][4], const float r[16][4],
+                        float out[4])
+{
+    static const enum VpFieldName neg[3] = { VP_A_NEG, VP_B_NEG, VP_C_NEG };
+    static const enum VpFieldName swz[3][4] = {
+        { VP_A_SWZ_X, VP_A_SWZ_Y, VP_A_SWZ_Z, VP_A_SWZ_W },
+        { VP_B_SWZ_X, VP_B_SWZ_Y, VP_B_SWZ_Z, VP_B_SWZ_W },
+        { VP_C_SWZ_X, VP_C_SWZ_Y, VP_C_SWZ_Z, VP_C_SWZ_W },
+    };
+    static const enum VpFieldName mux[3] = { VP_A_MUX, VP_B_MUX, VP_C_MUX };
+    const float *src;
+    float tmp[4];
+    uint32_t m = vp_field(t, mux[which]), reg, i;
+
+    if (which == 2)
+        reg = (vp_field(t, VP_C_R_HIGH) << 2) | vp_field(t, VP_C_R_LOW);
+    else
+        reg = vp_field(t, which == 0 ? VP_A_R : VP_B_R);
+
+    if (m == VP_PARAM_V) {
+        src = v[vp_field(t, VP_V) & 15u];
+    } else if (m == VP_PARAM_C) {
+        uint32_t c = vp_field(t, VP_CONST);
+        src = (c < VP_MAX_CONSTS) ? s_vp_const[c] : s_vp_const[0];
+    } else {
+        src = r[reg & 15u];
+    }
+
+    for (i = 0; i < 4; i++)
+        tmp[i] = src[vp_field(t, swz[which][i]) & 3u];
+    if (vp_field(t, neg[which]))
+        for (i = 0; i < 4; i++)
+            tmp[i] = -tmp[i];
+    memcpy(out, tmp, sizeof tmp);
+}
+
+static void vp_write_masked(float dst[4], const float src[4], uint32_t mask)
+{
+    /* The mask runs x,y,z,w from the high bit down. */
+    if (mask & 8u) dst[0] = src[0];
+    if (mask & 4u) dst[1] = src[1];
+    if (mask & 2u) dst[2] = src[2];
+    if (mask & 1u) dst[3] = src[3];
+}
+
+/* Run the uploaded program over one vertex, returning oPos. */
+static void vp_execute(const float v[16][4], float opos[4], float *ot0)
+{
+    float r[16][4], o[16][4];
+    uint32_t slot;
+
+    memset(r, 0, sizeof r);
+    memset(o, 0, sizeof o);
+    o[0][3] = 1.0f;
+
+    for (slot = 0; slot < s_vp_prog_len && slot < VP_MAX_SLOTS; slot++) {
+        const uint32_t *t = s_vp_prog[slot];
+        uint32_t mac = vp_field(t, VP_MAC), ilu = vp_field(t, VP_ILU);
+        float a[4], b[4], c[4], mres[4] = {0,0,0,0}, ires[4] = {0,0,0,0};
+        uint32_t out_r = vp_field(t, VP_OUT_R);
+        uint32_t i;
+
+        vp_read_src(t, 0, v, r, a);
+        vp_read_src(t, 1, v, r, b);
+        vp_read_src(t, 2, v, r, c);
+
+        switch (mac) {
+        case 1: memcpy(mres, a, sizeof mres); break;                /* MOV */
+        case 2: for (i=0;i<4;i++) mres[i] = a[i]*b[i]; break;       /* MUL */
+        case 3: for (i=0;i<4;i++) mres[i] = a[i]+c[i]; break;       /* ADD */
+        case 4: for (i=0;i<4;i++) mres[i] = a[i]*b[i]+c[i]; break;  /* MAD */
+        case 5: { float d = a[0]*b[0]+a[1]*b[1]+a[2]*b[2];          /* DP3 */
+                  for (i=0;i<4;i++) mres[i] = d; } break;
+        case 6: { float d = a[0]*b[0]+a[1]*b[1]+a[2]*b[2]+b[3];     /* DPH */
+                  for (i=0;i<4;i++) mres[i] = d; } break;
+        case 7: { float d = a[0]*b[0]+a[1]*b[1]+a[2]*b[2]+a[3]*b[3];/* DP4 */
+                  for (i=0;i<4;i++) mres[i] = d; } break;
+        case 8: mres[0]=1.0f; mres[1]=a[1]*b[1];                    /* DST */
+                mres[2]=a[2]; mres[3]=b[3]; break;
+        case 9: for (i=0;i<4;i++) mres[i] = a[i]<b[i]?a[i]:b[i]; break; /* MIN */
+        case 10:for (i=0;i<4;i++) mres[i] = a[i]>b[i]?a[i]:b[i]; break; /* MAX */
+        case 11:for (i=0;i<4;i++) mres[i] = a[i]<b[i]?1.0f:0.0f; break; /* SLT */
+        case 12:for (i=0;i<4;i++) mres[i] = a[i]>=b[i]?1.0f:0.0f; break;/* SGE */
+        default: break;                                              /* NOP, ARL */
+        }
+
+        switch (ilu) {
+        case 1: memcpy(ires, c, sizeof ires); break;                 /* MOV */
+        case 2: { float d = c[0] != 0.0f ? 1.0f/c[0] : 0.0f;         /* RCP */
+                  for (i=0;i<4;i++) ires[i] = d; } break;
+        case 3: { float d = c[0] != 0.0f ? 1.0f/c[0] : 0.0f;         /* RCC */
+                  for (i=0;i<4;i++) ires[i] = d; } break;
+        case 4: { float m2 = c[0] < 0.0f ? -c[0] : c[0];             /* RSQ */
+                  float d = m2 > 0.0f ? 1.0f/sqrtf(m2) : 0.0f;
+                  for (i=0;i<4;i++) ires[i] = d; } break;
+        case 5: { float d = powf(2.0f, c[0]);                        /* EXP */
+                  for (i=0;i<4;i++) ires[i] = d; } break;
+        case 6: { float d = c[0] > 0.0f ? logf(c[0])/logf(2.0f) : 0.0f; /* LOG */
+                  for (i=0;i<4;i++) ires[i] = d; } break;
+        default: break;                                              /* NOP, LIT */
+        }
+
+        /* MAC to its temporary, ILU to its own -- a paired ILU writes R1. */
+        if (mac) vp_write_masked(r[out_r & 15u], mres,
+                                 vp_field(t, VP_OUT_MAC_MASK));
+        if (ilu) vp_write_masked(r[mac ? 1u : (out_r & 15u)], ires,
+                                 vp_field(t, VP_OUT_ILU_MASK));
+
+        /* And whichever of the two the instruction routes to an output.
+         * OUTPUT_C is 0 and OUTPUT_O is 1, so the output-register bank is the
+         * set bit; writes to the constant bank are rare and not emulated. */
+        if (vp_field(t, VP_OUT_ORB)) {
+            uint32_t addr = vp_field(t, VP_OUT_ADDRESS) & 15u;
+            uint32_t omask = vp_field(t, VP_OUT_O_MASK);
+            if (omask)
+                vp_write_masked(o[addr],
+                                vp_field(t, VP_OUT_MUX) ? ires : mres, omask);
+        }
+
+        if (vp_field(t, VP_FINAL))
+            break;
+    }
+    memcpy(opos, o[0], sizeof o[0]);
+    if (ot0) memcpy(ot0, o[9], sizeof o[9]);
+}
+
 /* Half-space fill. Barycentric edge functions rather than scanline slopes:
  * the same test decides both windings, so a title that emits clockwise
  * triangles does not silently render nothing. */
@@ -920,6 +1325,7 @@ static void raster_triangle(const float a[2], const float b[2],
                             const float c[2], uint32_t argb,
                             const float uv[3][2])
 {
+
     uint8_t *mem = (uint8_t *)xbox_GetMemoryOffset();
     uint32_t bpp = surface_bpp();
     float area;
@@ -977,10 +1383,12 @@ static void raster_triangle(const float a[2], const float b[2],
                 if (sv < 0.0f) sv = 0.0f;
                 if (sample_texture((uint32_t)su, (uint32_t)sv, &texel)) {
                     put_pixel(mem, bpp, x, y, texel);
+                    cover_mark(x, y);
                     continue;
                 }
             }
             put_pixel(mem, bpp, x, y, argb);
+            cover_mark(x, y);
         }
     }
     s_gpu.tris_drawn++;
@@ -1136,11 +1544,16 @@ static int batch_is_screen_space(void)
 }
 
 /* NV097 primitive types that are triangles under some winding. */
-#define NV_PRIM_TRIANGLES      4
-#define NV_PRIM_TRIANGLE_STRIP 5
-#define NV_PRIM_TRIANGLE_FAN   6
-#define NV_PRIM_QUADS          7
-#define NV_PRIM_QUAD_STRIP     8
+#define NV_PRIM_POINTS         1
+#define NV_PRIM_LINES          2
+#define NV_PRIM_LINE_LOOP      3
+#define NV_PRIM_LINE_STRIP     4
+#define NV_PRIM_TRIANGLES      5
+#define NV_PRIM_TRIANGLE_STRIP 6
+#define NV_PRIM_TRIANGLE_FAN   7
+#define NV_PRIM_QUADS          8
+#define NV_PRIM_QUAD_STRIP     9
+#define NV_PRIM_POLYGON        10
 
 /* How many post-draw captures to keep: enough to see whether the geometry
  * is stable from frame to frame, few enough not to fill a directory. */
@@ -1156,26 +1569,314 @@ static void dump_surface_bmp(void);
  */
 static void raster_indexed(uint32_t i0, uint32_t i1, uint32_t i2, uint32_t argb)
 {
-    float p[3][4], uv[3][2];
-    int textured;
+    float p[3][4], uv[3][2], uv_vp[3][2];
+    int textured, vp_uv = 0;
 
     if (!fetch_attr(&s_gpu.attr[0], i0, p[0])
      || !fetch_attr(&s_gpu.attr[0], i1, p[1])
      || !fetch_attr(&s_gpu.attr[0], i2, p[2]))
         return;
 
+    /* Run the title's own vertex program when it asked for one.
+     *
+     * Without this the array positions are used as if they were screen
+     * space, which for the programmable path they are not: the position each
+     * draw wants is built by the program from constants the title rewrites
+     * between draws. Shin Megami Tensei: Nine submits every one of its draws
+     * that way and reuses one small vertex buffer, so ignoring the program
+     * put twenty-three consecutive glyph batches in one 18x18 rectangle. */
+    if (s_vp_on < 0)
+        s_vp_on = getenv("RECOMP_NO_VP") == NULL;
+    if (s_vp_on && (s_gpu.xform_mode & 3u) == 2u && s_vp_prog_len) {
+        uint32_t idx[3] = { i0, i1, i2 }, k;
+
+        for (k = 0; k < 3; k++) {
+            float v[16][4], opos[4];
+            uint32_t a;
+
+            memset(v, 0, sizeof v);
+            for (a = 0; a < NV_VERTEX_ATTRS && a < 16; a++) {
+                v[a][3] = 1.0f;
+                fetch_attr(&s_gpu.attr[a], idx[k], v[a]);
+            }
+            {
+                float ot0[4] = {0,0,0,0};
+                vp_execute((const float (*)[4])v, opos, ot0);
+                /* Does the program write oT0 at all? If it leaves the
+                 * register untouched the raw attribute is the right source
+                 * and the UV error is somewhere else; if it writes, the
+                 * program's value is what the hardware would sample with. */
+                /* The program's own texture coordinate, not the vertex
+                 * attribute.
+                 *
+                 * Measured on this title's glyph pages: the attribute
+                 * arrives normalised and the program passes u straight
+                 * through but multiplies v by four -- input v 0.1875 comes
+                 * out 0.75. Sampling the attribute instead lands a quarter
+                 * of the way up the page, between two rows of the glyph
+                 * grid, which is why the keyboard showed strokes rather
+                 * than characters. */
+                if (tex_size_from_format(s_gpu.tex.color)) {
+                    uv_vp[k][0] = ot0[0] * (float)s_gpu.tex.width;
+                    uv_vp[k][1] = ot0[1] * (float)s_gpu.tex.height;
+                } else {
+                    uv_vp[k][0] = ot0[0];
+                    uv_vp[k][1] = ot0[1];
+                }
+                vp_uv = 1;
+                if (PB_ENV_OT0
+                        && d3d8_format_dxt_block_bytes(s_gpu.tex.color)) {
+                    static unsigned n;
+                    if (n++ < 6) {
+                        float raw[2];
+                        int ok = fetch_texcoord(idx[k], raw);
+                        fprintf(stderr, "  [OT0] oT0=(%.4f %.4f %.4f %.4f)"
+                                "  atributo cru=(%.1f %.1f) ok=%d\n",
+                                ot0[0], ot0[1], ot0[2], ot0[3],
+                                ok ? raw[0] : -1.0f, ok ? raw[1] : -1.0f, ok);
+                    }
+                }
+            }
+            if (opos[3] != 0.0f) {
+                opos[0] /= opos[3];
+                opos[1] /= opos[3];
+            }
+            /* Straight through, no viewport transform.
+             *
+             * Measured on the title above, the program is a pass-through
+             * with half a pixel of offset: (0,0) comes out (0.531,0.531) and
+             * (640,480) comes out (640.531,480.531). Those are already
+             * surface pixels, so applying the programmed viewport (offset
+             * 320.5,240.5 scale 320,-240) on top sends a full-screen quad to
+             * 205290 and every triangle falls off the surface.
+             * RECOMP_VP_VIEWPORT restores it for a program that really does
+             * emit clip space. */
+            if (s_vp_have_viewport == 3 && PB_ENV_VP_VIEWPT) {
+                p[k][0] = opos[0] * s_vp_viewport_scale[0]
+                        + s_vp_viewport_off[0];
+                p[k][1] = opos[1] * s_vp_viewport_scale[1]
+                        + s_vp_viewport_off[1];
+            } else {
+                p[k][0] = opos[0];
+                p[k][1] = opos[1];
+            }
+        }
+    }
+
     textured = fetch_texcoord(i0, uv[0])
             && fetch_texcoord(i1, uv[1])
             && fetch_texcoord(i2, uv[2]);
+
+    /* Where the program ran, its output is in principle the coordinate the
+     * hardware would have sampled with -- measured, this title's program
+     * passes u through and multiplies v by four on some draws, so the
+     * attribute and the output genuinely differ.
+     *
+     * Opt-in, not default: it has not been shown to improve the picture. An
+     * A/B on rendered frames was inconclusive because the two runs reach
+     * different screens at the same frame number, and an earlier attempt at
+     * this smeared the keyboard badly. Until there is a comparison that
+     * holds, the attribute stays the default. */
+    if (vp_uv && PB_ENV_VP_UV) {
+        memcpy(uv, uv_vp, sizeof uv);
+        textured = 1;
+    }
+    /* No attribute at all is a different case from an attribute that
+     * disagrees with the program. A batch with a texture bound and no
+     * texture coordinate in its vertex format has exactly one place its
+     * coordinates can come from, and that is the program's oT0: there is
+     * nothing here to prefer the attribute over. This title's video quad is
+     * such a batch -- full screen, texture bound, four floats of position
+     * and a packed colour, and nothing else -- and without this it is
+     * painted in flat colour. */
+    else if (vp_uv && !textured && s_gpu.tex.valid) {
+        memcpy(uv, uv_vp, sizeof uv);
+        textured = 1;
+        s_gpu.batches_uv_from_vp++;
+    }
+
+    /* A vertex nowhere near the screen.
+     *
+     * Found by accident: a 176-wide quad came out 1342177408 pixels tall.
+     * A coordinate that large is not geometry, it is a bad read -- and a
+     * triangle carrying one has a bounding box covering the whole surface,
+     * so it paints over everything inside the clip rect. */
+    if (PB_ENV_WILD) {
+        int k;
+        for (k = 0; k < 3; k++) {
+            if (p[k][0] < -4096.0f || p[k][0] > 4096.0f
+             || p[k][1] < -4096.0f || p[k][1] > 4096.0f) {
+                static unsigned n;
+                if (n++ < 10) {
+                    const VertexAttr *a = &s_gpu.attr[0];
+                    uint32_t idx = (k == 0) ? i0 : (k == 1) ? i1 : i2;
+                    unsigned w;
+                    fprintf(stderr, "  [WILD] v%d(idx %u) = (%g,%g)  prim=%u "
+                            "n=%u inline=%d count=%u a0(sz=%u ty=%u str=%u "
+                            "off=0x%X)\n",
+                            k, idx, p[k][0], p[k][1], s_gpu.prim,
+                            s_gpu.idx_count, s_gpu.inline_active,
+                            s_gpu.inline_count, a->size, a->type, a->stride,
+                            a->offset);
+                    /* The payload as the title wrote it. A stride that does
+                     * not match the layout shows up here as the same words
+                     * appearing one slot early or late. */
+                    fprintf(stderr, "         payload:");
+                    for (w = 0; w < s_gpu.inline_count && w < 28; w++)
+                        fprintf(stderr, "%s %08X", (w % 7 == 0) ? " |" : "",
+                                s_gpu.inline_buf[w]);
+                    fprintf(stderr, "\n");
+                    fflush(stderr);
+                }
+                break;
+            }
+        }
+    }
+
+    /* RECOMP_PIXEL_TRACE=<x>,<y>: every batch that covers one point, in the
+     * order they are drawn. "That glyph is missing" is a question about one
+     * pixel, and the list says whether nothing drew there or something drew
+     * over it. */
+    {
+        const char *pt = PB_ENV_PIXEL;
+        if (pt) {
+            /* Parsed once, not per triangle. Two strtof calls for every
+             * triangle drawn is the same mistake as calling getenv there:
+             * the probe was slow enough to change what the title did, and
+             * a run with it set never left the title screen while the same
+             * build without it reached the third menu. */
+            static float px, py;
+            static int parsed;
+            if (!parsed) {
+                char *e;
+                parsed = 1;
+                px = strtof(pt, &e);
+                py = (*e == ',') ? strtof(e + 1, &e) : 0.0f;
+            }
+            float lo_x = p[0][0], hi_x = p[0][0];
+            float lo_y = p[0][1], hi_y = p[0][1];
+            int i;
+            for (i = 1; i < 3; i++) {
+                if (p[i][0] < lo_x) lo_x = p[i][0];
+                if (p[i][0] > hi_x) hi_x = p[i][0];
+                if (p[i][1] < lo_y) lo_y = p[i][1];
+                if (p[i][1] > hi_y) hi_y = p[i][1];
+            }
+            if (px >= lo_x && px <= hi_x && py >= lo_y && py <= hi_y) {
+                static unsigned n;
+                static int seen_glyph;
+                static unsigned glyph_flip;
+                /* Armed only once a DXT3 texture has been bound.
+                 *
+                 * Printing from inside the rasteriser is not free: 2712
+                 * lines of it stalled the title badly enough that it never
+                 * left the first screen, so the probe prevented the very
+                 * navigation it was installed to observe. Runs with it on
+                 * reached 1 texture where the same build without it reached
+                 * 13.
+                 *
+                 * The font atlas is the only DXT3 this title binds and it
+                 * loads on the name-entry screen, so waiting for one keeps
+                 * everything before that at full speed. */
+                if (s_pixa_armed && PB_ENV_PIXEL_ALL) {
+                    /* Unfiltered, one frame at a time.
+                     *
+                     * Every draw covering the point, in the order they are
+                     * drawn, reset at each flip. A flat cap across the
+                     * whole run fills with the two full-screen quads that
+                     * cover every point in every frame, so ten frames of
+                     * background is all you get to see -- which is the
+                     * wrong axis again. The size is printed because that is
+                     * what tells a glyph from a panel from a backdrop. */
+                    static unsigned all_flip = 0xFFFFFFFFu;
+                    if (all_flip != s_gpu.flips) {
+                        all_flip = s_gpu.flips;
+                        n = 0;
+                        fprintf(stderr, "  [PIXA] --- flip %u ---\n",
+                                s_gpu.flips);
+                    }
+                    if (n++ < 24)
+                        fprintf(stderr, "  [PIXA] #%u %.0fx%.0f at (%.0f,%.0f)"
+                                " tex=0x%08X fmt=0x%02X textured=%d"
+                                " argb=%08X\n",
+                                n, hi_x - lo_x, hi_y - lo_y, lo_x, lo_y,
+                                s_gpu.tex.offset, s_gpu.tex.color,
+                                textured, argb);
+                } else {
+                /* Bounded to ONE frame. The earlier version printed 24
+                 * matches that all had the same uv and the same rect: they
+                 * were one draw per frame across 24 frames, not the draw
+                 * order inside a frame, so "nothing overdraws the glyph"
+                 * was a conclusion about the wrong axis. */
+                if (seen_glyph && s_gpu.flips != glyph_flip) {
+                    seen_glyph = 0; n = 0;
+                }
+                /* Everything that covers the pixel once a glyph-sized draw
+                 * has landed on it. Filtering the full-screen quads out
+                 * entirely hides the one thing that would explain an
+                 * invisible glyph: a background quad drawn after it. */
+                int small = (hi_x - lo_x) < 64.0f && (hi_y - lo_y) < 64.0f;
+                if (small && !seen_glyph) {
+                    seen_glyph = 1; glyph_flip = s_gpu.flips;
+                }
+                if (seen_glyph && n++ < 20)
+                    fprintf(stderr, "  [PIX] #%u tex=0x%08X fmt=0x%02X"
+                            " textured=%d uv=(%.0f,%.0f)-(%.0f,%.0f)"
+                            " rect=(%.0f,%.0f)-(%.0f,%.0f)\n",
+                            n, s_gpu.tex.offset, s_gpu.tex.color, textured,
+                            uv[0][0], uv[0][1], uv[2][0], uv[2][1],
+                            lo_x, lo_y, hi_x, hi_y);
+                }
+            }
+        }
+    }
+
+    /* RECOMP_CELL_TRACE: how many distinct glyph cells the title actually
+     * draws. "The keyboard is empty" could mean the cells are drawn wrong or
+     * that only a handful are drawn at all, and counting distinct
+     * (uv, screen rect) pairs separates the two. */
+    if (PB_ENV_CELL && textured
+            && d3d8_format_dxt_block_bytes(s_gpu.tex.color)) {
+        static struct { int u, v, x, y; } seen[128];
+        static int nseen, reported;
+        int u0 = (int)uv[0][0], v0 = (int)uv[0][1];
+        int x0 = (int)p[0][0], y0 = (int)p[0][1], i, known = 0;
+        for (i = 0; i < nseen; i++)
+            if (seen[i].u == u0 && seen[i].v == v0
+                    && seen[i].x == x0 && seen[i].y == y0) { known = 1; break; }
+        if (!known && nseen < 128) {
+            seen[nseen].u = u0; seen[nseen].v = v0;
+            seen[nseen].x = x0; seen[nseen].y = y0;
+            nseen++;
+        }
+        if (nseen >= 40 && !reported) {
+            reported = 1;
+            fprintf(stderr, "  [CELL] %d celulas distintas ate aqui\n", nseen);
+            for (i = 0; i < nseen && i < 12; i++)
+                fprintf(stderr, "  [CELL]   uv(%d,%d) tela(%d,%d)\n",
+                        seen[i].u, seen[i].v, seen[i].x, seen[i].y);
+        }
+    }
 
     raster_triangle(p[0], p[1], p[2], argb,
                     textured ? (const float (*)[2])uv : NULL);
 }
 
+/* Glyph-sized textured batches in the current frame.
+ *
+ * "Some letters are missing" has two shapes and they need different fixes:
+ * the title emits a quad per glyph and we lose most of them, or the title
+ * only emits a few. Counting what arrives, per frame, tells them apart --
+ * and the per-frame part matters because the set that renders changes
+ * between frames on a screen that is not moving. */
+static unsigned s_glyph_batches;
+
 static void raster_batch(void)
 {
     uint32_t i;
     uint32_t before = s_gpu.tris_drawn;
+    unsigned long px_before;
+    int fmv_batch = 0;
 
     if (s_gpu.idx_count < 3)
         return;
@@ -1188,8 +1889,27 @@ static void raster_batch(void)
     {
         const VertexAttr *tc = texcoord_attr();
 
-        if (!(tc->offset && tc->stride))
+        if (!(tc->offset && tc->stride)) {
             s_gpu.batches_no_uv++;
+            /* Which attributes a batch without texture coordinates does
+             * have. Half this title's batches land here and are drawn in
+             * flat colour, which for a video quad is a black screen. */
+            if (getenv("RECOMP_NOUV_TRACE")) {
+                static unsigned n;
+                if (n++ < 6) {
+                    uint32_t a;
+                    fprintf(stderr, "  [NOUV] prim=%u n=%u tex=0x%08X inline=%d:",
+                            s_gpu.prim, s_gpu.idx_count, s_gpu.tex.offset,
+                            s_gpu.inline_active);
+                    for (a = 0; a < NV_VERTEX_ATTRS; a++)
+                        if (s_gpu.attr[a].size || s_gpu.attr[a].stride)
+                            fprintf(stderr, " a%u(sz=%u ty=%u str=%u off=0x%X)",
+                                    a, s_gpu.attr[a].size, s_gpu.attr[a].type,
+                                    s_gpu.attr[a].stride, s_gpu.attr[a].offset);
+                    fprintf(stderr, "\n");
+                }
+            }
+        }
         else if (!s_gpu.tex.valid)
             s_gpu.batches_no_tex++;
         else {
@@ -1197,6 +1917,64 @@ static void raster_batch(void)
             note_texture_use();
         }
     }
+
+    /* Histogram of primitive op against vertex count. A real TRIANGLES
+     * batch always carries a multiple of three; that is what tells the
+     * hardware's numbering apart from a guess at it. */
+    if (getenv("RECOMP_PRIM_HIST")) {
+        static unsigned hist[16][4];
+        static unsigned seen;
+        if (s_gpu.prim < 16) {
+            hist[s_gpu.prim][s_gpu.idx_count % 3]++;
+            hist[s_gpu.prim][3]++;
+        }
+        if (++seen % 2000 == 0) {
+            unsigned k;
+            for (k = 0; k < 16; k++)
+                if (hist[k][3])
+                    fprintf(stderr, "  [PRIM] op=%u total=%u  n%%3: 0->%u 1->%u 2->%u\n",
+                            k, hist[k][3], hist[k][0], hist[k][1], hist[k][2]);
+        }
+    }
+
+    /* The four corners of a strip batch, in submission order. Fan and
+     * strip decomposition of the same four points cover different areas
+     * unless the points are ordered so that they do not. */
+    if (getenv("RECOMP_STRIP_TRACE") && s_gpu.prim == NV_PRIM_TRIANGLE_STRIP
+        && s_gpu.idx_count == 4) {
+        static unsigned n;
+        if (n++ < 8) {
+            float q[4][4];
+            unsigned k;
+            fprintf(stderr, "  [STRIP]");
+            for (k = 0; k < 4; k++)
+                if (fetch_attr(&s_gpu.attr[0], s_gpu.idx[k], q[k]))
+                    fprintf(stderr, " (%.0f,%.0f)", q[k][0], q[k][1]);
+            fprintf(stderr, "\n");
+        }
+    }
+
+    if (s_cover_on < 0)
+        s_cover_on = getenv("RECOMP_COVER_TRACE") != NULL;
+
+    /* Every batch that samples the video surface: how it is drawn, where,
+     * and how often. A movie that plays should be one such batch per frame. */
+    if (getenv("RECOMP_FMV_TRACE") && s_gpu.tex.valid
+        && s_gpu.tex.color == 0x24) {
+        static unsigned n;
+        float q[4][4];
+        unsigned k;
+        fprintf(stderr, "  [FMV] #%u op=%u n=%u tex=0x%08X %ux%u pitch=%u:",
+                ++n, s_gpu.prim, s_gpu.idx_count, s_gpu.tex.offset,
+                s_gpu.tex.width, s_gpu.tex.height, s_gpu.tex.pitch);
+        for (k = 0; k < s_gpu.idx_count && k < 4; k++)
+            if (fetch_attr(&s_gpu.attr[0], s_gpu.idx[k], q[k]))
+                fprintf(stderr, " (%.0f,%.0f)", q[k][0], q[k][1]);
+        fprintf(stderr, "\n");
+        fmv_batch = 1;
+    }
+    px_before = s_px_written;
+    s_cover_batch++;
 
     switch (s_gpu.prim) {
     case NV_PRIM_TRIANGLES:
@@ -1210,16 +1988,49 @@ static void raster_batch(void)
                            vertex_color(s_gpu.idx[i]));
         break;
     case NV_PRIM_TRIANGLE_FAN:
-    case NV_PRIM_QUADS:
-    case NV_PRIM_QUAD_STRIP:
-        /* A fan and a quad both rasterise as a triangle fan around index 0;
-         * for a quad that is exactly its two triangles. */
+    case NV_PRIM_POLYGON:
         for (i = 1; i + 1 < s_gpu.idx_count; i++)
             raster_indexed(s_gpu.idx[0], s_gpu.idx[i], s_gpu.idx[i+1],
                            vertex_color(s_gpu.idx[0]));
         break;
+    case NV_PRIM_QUADS:
+        /* Independent quads, four vertices each: a batch of eight is two
+         * quads, not one six-triangle fan around the first vertex. */
+        for (i = 0; i + 3 < s_gpu.idx_count; i += 4) {
+            raster_indexed(s_gpu.idx[i], s_gpu.idx[i+1], s_gpu.idx[i+2],
+                           vertex_color(s_gpu.idx[i]));
+            raster_indexed(s_gpu.idx[i], s_gpu.idx[i+2], s_gpu.idx[i+3],
+                           vertex_color(s_gpu.idx[i]));
+        }
+        break;
+    case NV_PRIM_QUAD_STRIP:
+        /* Each pair of vertices past the first pair closes another quad
+         * against the pair before it. */
+        for (i = 0; i + 3 < s_gpu.idx_count; i += 2) {
+            raster_indexed(s_gpu.idx[i], s_gpu.idx[i+1], s_gpu.idx[i+3],
+                           vertex_color(s_gpu.idx[i]));
+            raster_indexed(s_gpu.idx[i], s_gpu.idx[i+3], s_gpu.idx[i+2],
+                           vertex_color(s_gpu.idx[i]));
+        }
+        break;
     default:
         break;                             /* points and lines: not yet */
+    }
+
+    /* How much of the surface each batch actually paints, with the corners
+     * and texture it painted from. A screen that is part image and part
+     * black is one batch covering less than it should, and this says which. */
+    if (s_cover_on && s_px_written - px_before > 20000) {
+        float q[4][4];
+        unsigned k;
+        fprintf(stderr, "  [COVER] op=%u n=%u px=%lu tex=0x%08X uv=%d:",
+                s_gpu.prim, s_gpu.idx_count,
+                s_px_written - px_before, s_gpu.tex.offset,
+                (int)(s_gpu.attr[9].offset && s_gpu.attr[9].stride));
+        for (k = 0; k < s_gpu.idx_count && k < 4; k++)
+            if (fetch_attr(&s_gpu.attr[0], s_gpu.idx[k], q[k]))
+                fprintf(stderr, " (%.0f,%.0f)", q[k][0], q[k][1]);
+        fprintf(stderr, "\n");
     }
 
     if (s_gpu.tris_drawn && (s_gpu.tris_drawn % 500) == 0)
@@ -1232,6 +2043,46 @@ static void raster_batch(void)
      * was wiped a moment ago -- which reads as "nothing was drawn" when the
      * triangles went down correctly just before it. A few frames that actually
      * contain geometry are worth more than any number of clears. */
+    /* What a glyph-sized batch actually samples.
+     *
+     * The count alone cannot separate the cell backgrounds from the
+     * letters -- both are small and both come from a DXT3 atlas. This adds
+     * the texture it reads, the texel range, and the pixel that comes back
+     * from the middle of it, which says whether the draw produces ink or
+     * nothing and why. */
+    if (getenv("RECOMP_GLYPH_UV") && s_gpu.tex.valid
+        && d3d8_format_dxt_block_bytes(s_gpu.tex.color) && s_gpu.idx_count >= 3) {
+        static unsigned n;
+        float q[4], uv0[2], uv1[2];
+        if (n < 24 && fetch_attr(&s_gpu.attr[0], s_gpu.idx[0], q)
+            && fetch_texcoord(s_gpu.idx[0], uv0)
+            && fetch_texcoord(s_gpu.idx[2], uv1)) {
+            uint32_t texel = 0;
+            int got = sample_texture((uint32_t)((uv0[0] + uv1[0]) * 0.5f),
+                                     (uint32_t)((uv0[1] + uv1[1]) * 0.5f),
+                                     &texel);
+            n++;
+            fprintf(stderr, "  [GUV] tex=0x%08X at(%.0f,%.0f) uv(%.0f,%.0f)-"
+                    "(%.0f,%.0f) centre=%s%08X\n",
+                    s_gpu.tex.offset, q[0], q[1], uv0[0], uv0[1],
+                    uv1[0], uv1[1], got ? "" : "MISS ", texel);
+            fflush(stderr);
+        }
+    }
+
+    /* Small, textured, and the texture is the DXT3 font atlas. */
+    if (s_gpu.tex.valid && d3d8_format_dxt_block_bytes(s_gpu.tex.color)) {
+        float q[4][4];
+        if (s_gpu.idx_count >= 3 && fetch_attr(&s_gpu.attr[0], s_gpu.idx[0], q[0])
+            && fetch_attr(&s_gpu.attr[0], s_gpu.idx[1], q[1])) {
+            float dx = q[1][0] - q[0][0], dy = q[1][1] - q[0][1];
+            if (dx < 64.0f && dx > -64.0f && dy < 64.0f && dy > -64.0f)
+                s_glyph_batches++;
+        }
+    }
+
+    if (fmv_batch)
+        dump_surface_bmp();
     if (s_gpu.tris_drawn != before && s_drawn_dumps < FB_DUMP_AFTER_DRAW) {
         s_drawn_dumps++;
         dump_surface_bmp();
@@ -1591,6 +2442,15 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
     case NV097_SET_COLOR_CLEAR_VALUE:
         s_gpu.clear_color = param;
         break;
+    case NV097_SET_BLEND_ENABLE:
+        s_gpu.blend_enable = param;
+        break;
+    case NV097_SET_BLEND_FUNC_SFACTOR:
+        s_gpu.blend_sfactor = param;
+        break;
+    case NV097_SET_BLEND_FUNC_DFACTOR:
+        s_gpu.blend_dfactor = param;
+        break;
     case NV097_CLEAR_SURFACE:
         clear_surface(param);
         break;
@@ -1622,6 +2482,8 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
          * because the format is only fully known at END. */
         if (s_gpu.prim && s_gpu.inline_count < NV_MAX_INLINE)
             s_gpu.inline_buf[s_gpu.inline_count++] = param;
+        else if (s_gpu.prim)
+            s_gpu.inline_dropped++;    /* past the buffer: silently lost */
         break;
 
     case NV097_DRAW_ARRAYS: {
@@ -1675,6 +2537,15 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
         s_gpu.flip_write = s_gpu.flip_modulo
                          ? (s_gpu.flip_write + 1) % s_gpu.flip_modulo
                          : s_gpu.flip_write + 1;
+        if (s_glyph_batches && getenv("RECOMP_GLYPH_COUNT")) {
+            static unsigned n;
+            if (n++ < 40) {
+                fprintf(stderr, "  [GLYPH] flip %u: %u glyph-sized batches\n",
+                        s_gpu.flips, s_glyph_batches);
+                fflush(stderr);
+            }
+        }
+        s_glyph_batches = 0;
         s_gpu.flips++;
         return;
 
@@ -1685,6 +2556,23 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
         /* And this is a completed swap, which is what a title's own swap
          * counter counts -- see xbox_Nv2aFrameCounterFlip. */
         xbox_Nv2aFrameCounterFlip();
+        /* Hand the window a copy of the frame just finished.
+         *
+         * The buffer the title has finished is the one the last batch drew
+         * into, which is what drawn_offset holds and why it exists -- by now
+         * color_offset has moved to the next buffer. Copying here, rather
+         * than letting the window read guest memory on its own clock, is
+         * also what stops it showing a surface the rasteriser is still
+         * writing: that was the flicker. */
+        if (s_gpu.pitch) {
+            extern void xbox_FramebufferWindowPresent(uint32_t, uint32_t);
+            uint32_t done = s_gpu.drawn_offset ? s_gpu.drawn_offset
+                                               : s_gpu.color_offset;
+            if (done) {
+                xbox_FramebufferWindowSet(dma_resolve(done), s_gpu.pitch);
+                xbox_FramebufferWindowPresent(dma_resolve(done), s_gpu.pitch);
+            }
+        }
         if (getenv("RECOMP_PB_EXEC_VERBOSE")) {
             static unsigned n;
             if (n++ < 8) {
@@ -1727,6 +2615,15 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
         break;
 
     case NV097_SET_TEXTURE_IMAGE_RECT:
+        if (getenv("RECOMP_RECT_TRACE")) {
+            static unsigned n;
+            if (n++ < 12)
+                fprintf(stderr, "  [RECT] tex 0x%08X fmt 0x%02X: format said"
+                        " %ux%u, IMAGE_RECT says %ux%u\n",
+                        s_gpu.tex.offset, s_gpu.tex.color,
+                        s_gpu.tex.width, s_gpu.tex.height,
+                        param >> 16, param & 0xFFFF);
+        }
         s_gpu.tex.width  = param >> 16;
         s_gpu.tex.height = param & 0xFFFF;
         record_tex_reg(method, param);
@@ -1750,6 +2647,22 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
             a->type   =  param        & 0x0F;
             a->size   = (param >> 4)  & 0x0F;
             a->stride = (param >> 8)  & 0xFF;
+        } else if (method == 0x1E94) {          /* TRANSFORM_EXECUTION_MODE */
+            s_gpu.xform_mode = param;
+        } else if (method == 0x1E9C) {          /* TRANSFORM_PROGRAM_LOAD */
+            s_vp_prog_load = param; s_vp_prog_dw = 0;
+        } else if (method == 0x1EA4) {          /* TRANSFORM_CONSTANT_LOAD */
+            s_vp_const_load = param; s_vp_const_dw = 0;
+        } else if (method >= 0x0B00 && method <= 0x0B7C) {
+            vp_load_program_word(param);
+        } else if (method >= 0x0B80 && method <= 0x0BFC) {
+            vp_load_constant_word(param);
+        } else if (method >= 0x0A20 && method <= 0x0A2C) {
+            memcpy(&s_vp_viewport_off[(method - 0x0A20) / 4], &param, 4);
+            s_vp_have_viewport |= 1;
+        } else if (method >= 0x0AF0 && method <= 0x0AFC) {
+            memcpy(&s_vp_viewport_scale[(method - 0x0AF0) / 4], &param, 4);
+            s_vp_have_viewport |= 2;
         } else if (!imm_vertex_method(method, param)) {
             note_unhandled(method, param);
         }
@@ -1959,6 +2872,12 @@ void nv2a_pb_exec_report(void)
     fprintf(stderr, "[GPU] batches: %u textured, %u with no texcoords,"
                     " %u with texcoords but no usable stage\n",
             s_gpu.batches_textured, s_gpu.batches_no_uv, s_gpu.batches_no_tex);
+    fprintf(stderr, "  [GPU] %u batches took texture coordinates from the vertex program\n",
+            s_gpu.batches_uv_from_vp);
+    fprintf(stderr, "  [GPU] %u inline attribute reads ran past the payload\n",
+            s_gpu.inline_short);
+    fprintf(stderr, "  [GPU] %u inline vertex dwords dropped (buffer is %u)\n",
+            s_gpu.inline_dropped, (unsigned)NV_MAX_INLINE);
     for (i = 0; i < s_tex_use_count; i++)
         fprintf(stderr, "  [TEXUSE] 0x%08X %ux%u fmt 0x%02X%s: %u batches\n",
                 s_tex_use[i].offset, s_tex_use[i].width, s_tex_use[i].height,

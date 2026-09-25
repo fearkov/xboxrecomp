@@ -14,6 +14,7 @@
 
 #include "xbox_memory_layout.h"
 #include "kernel.h"
+#include "../usb/ohci.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -67,16 +68,6 @@ static HANDLE g_mapping_handle = NULL;
 
 /* Mirror view pointers for cleanup */
 static void *g_mirror_views[XBOX_NUM_MIRRORS] = {0};
-
-/* The base view and its 28 mirrors occupy one contiguous span. Reserving that
- * span up front is what makes the mirrors placeable at all: each one sits at
- * base + N * 64 MB, and on a host that chose the base for us, those addresses
- * run through whatever the loader already owns. Placing them one at a time
- * means ~3 of 28 collide, and *which* three changes with ASLR. Claiming the
- * whole range first, then carving views out of ground we hold, removes the
- * question. */
-static void *g_span_base = NULL;
-static size_t g_span_size = 0;
 static void *g_tiled_view = NULL;
 
 /* Contiguous / physical memory window (see MemoryLayoutInit).
@@ -388,6 +379,226 @@ static LONG CALLBACK ac97_write_veh(PEXCEPTION_POINTERS ep)
     return EXCEPTION_CONTINUE_SEARCH;
 }
 
+
+/* ---- RECOMP_WATCH: name the guest code that changes a guest dword -------
+ *
+ * A peek says a value changed between two samples. It does not say who
+ * changed it, and for a value produced deep inside a middleware layer that
+ * is the only question that matters -- reading the lifted C outwards from
+ * the write is guesswork, and reading it inwards from the caller is worse.
+ *
+ * Same mechanism as the AC'97 trap above: make the page read-only, catch the
+ * write, single-step it, then report. What it adds is the guest call chain,
+ * scanned off the guest stack the way the watchdog does, which turns "the
+ * mask became 4" into a list of addresses to go and read.
+ *
+ * Off unless RECOMP_WATCH is set. Costs a page fault per write to that page,
+ * so it is a bring-up tool and says so.
+ */
+static int peek_readable(uint32_t va);          /* defined further down */
+extern RECOMP_TLS uint32_t g_esp;
+
+static uint32_t g_watch_va;
+static void    *g_watch_page;
+static uint32_t g_watch_last;
+static void    *g_watch_veh;
+static RECOMP_TLS int s_watch_stepping;
+
+/* A plausible guest code address: inside the image, above the headers. The
+ * bound is the end of XPP, which is the last section holding code here. */
+static int watch_is_code(uint32_t va)
+{
+    return va >= 0x00011000u && va < 0x00317460u;
+}
+
+static void watch_report(void)
+{
+    const uint8_t *mem = (const uint8_t *)g_memory_offset;
+    uint32_t now = *(const uint32_t *)(mem + g_watch_va);
+    uint32_t esp = g_esp, i, shown = 0;
+
+    if (now == g_watch_last)
+        return;
+    fprintf(stderr, "[WATCH] [%08X] %08X -> %08X  (esp=%08X)\n",
+            g_watch_va, g_watch_last, now, esp);
+    g_watch_last = now;
+
+    /* Return addresses the recompiled code pushed, innermost first. Values
+     * that merely look like code get printed too -- the chain is a lead, not
+     * a proof, and saying so is cheaper than a stack walk that cannot be
+     * done without frame information the lift does not keep. */
+    for (i = 0; esp && i < 256u && shown < 12u; i++) {
+        uint32_t slot = esp + i * 4u;
+        uint32_t v;
+        if (!peek_readable(slot))
+            break;
+        v = *(const uint32_t *)(mem + slot);
+        if (watch_is_code(v)) {
+            fprintf(stderr, "         [esp+%-4u] %08X\n", i * 4u, v);
+            shown++;
+        }
+    }
+
+    /* RECOMP_WATCH_RAW also prints the frame unfiltered. The filtered chain
+     * answers "who wrote this"; the raw frame answers "to what object", which
+     * is the next question every time -- saved registers and pointer
+     * arguments live there and look nothing like code. */
+    if (getenv("RECOMP_WATCH_RAW")) {
+        for (i = 0; esp && i < 24u; i++) {
+            uint32_t slot = esp + i * 4u;
+            if (!peek_readable(slot))
+                break;
+            fprintf(stderr, "         raw[esp+%-4u] %08X\n", i * 4u,
+                    *(const uint32_t *)(mem + slot));
+        }
+    }
+    fflush(stderr);
+}
+
+static LONG CALLBACK watch_veh(PEXCEPTION_POINTERS ep)
+{
+    DWORD code = ep->ExceptionRecord->ExceptionCode;
+    DWORD old;
+
+    if (!g_watch_page)
+        return EXCEPTION_CONTINUE_SEARCH;
+
+    if (code == EXCEPTION_SINGLE_STEP && s_watch_stepping) {
+        s_watch_stepping = 0;
+        watch_report();
+        VirtualProtect(g_watch_page, 4096, PAGE_READONLY, &old);
+        ep->ContextRecord->EFlags &= ~0x100u;
+        return EXCEPTION_CONTINUE_EXECUTION;
+    }
+
+    if (code == EXCEPTION_ACCESS_VIOLATION
+            && ep->ExceptionRecord->ExceptionInformation[0] == 1) {
+        uintptr_t fault = ep->ExceptionRecord->ExceptionInformation[1];
+
+        if (fault >= (uintptr_t)g_watch_page
+                && fault < (uintptr_t)g_watch_page + 4096) {
+            if (!VirtualProtect(g_watch_page, 4096, PAGE_READWRITE, &old))
+                return EXCEPTION_CONTINUE_SEARCH;
+            s_watch_stepping = 1;
+            ep->ContextRecord->EFlags |= 0x100u;
+            return EXCEPTION_CONTINUE_EXECUTION;
+        }
+    }
+    return EXCEPTION_CONTINUE_SEARCH;
+}
+
+/* The target, which may be reached through pointers that do not exist yet.
+ *
+ * "[[0x006DF414]]+0x14" is two dereferences and an offset: the interesting
+ * field of a heap object whose address changes run to run, but which is
+ * always reachable from a static one. Without this the only way to watch such
+ * a field is to learn its address from one run and hope the allocator repeats
+ * it, which it does not. */
+static unsigned g_watch_derefs;
+static uint32_t g_watch_root;
+static uint32_t g_watch_off;
+
+static int watch_resolve(uint32_t *out)
+{
+    const uint8_t *mem = (const uint8_t *)g_memory_offset;
+    uint32_t a = g_watch_root;
+    unsigned k;
+
+    for (k = 0; k < g_watch_derefs; k++) {
+        if (!peek_readable(a))
+            return 0;
+        a = *(const uint32_t *)(mem + a);
+        if (!a)
+            return 0;
+    }
+    a += g_watch_off;
+    if (!peek_readable(a))
+        return 0;
+    *out = a;
+    return 1;
+}
+
+static int watch_arm(uint32_t va);
+
+/* Poll until the chain resolves, then arm. Twenty milliseconds, because the
+ * object appears once during bring-up and never again -- this thread exists
+ * for a few seconds and then does nothing for the rest of the run. */
+static DWORD WINAPI watch_resolver(LPVOID unused)
+{
+    unsigned tries;
+
+    (void)unused;
+    for (tries = 0; tries < 15000u && !g_watch_page; tries++) {
+        uint32_t va;
+        if (watch_resolve(&va) && watch_arm(va))
+            return 0;
+        Sleep(20);
+    }
+    if (!g_watch_page)
+        fprintf(stderr, "  WATCH: %u-deep chain from 0x%08X never resolved\n",
+                g_watch_derefs, g_watch_root);
+    return 0;
+}
+
+void xbox_WatchInit(void)
+{
+    const char *spec = getenv("RECOMP_WATCH");
+    const char *q;
+    char *endp;
+
+    if (!spec || !*spec || g_memory_base == NULL || g_watch_page)
+        return;
+
+    for (q = spec; *q == '['; q++)
+        g_watch_derefs++;
+    g_watch_root = (uint32_t)strtoul(q, &endp, 0);
+    while (*endp == ']')
+        endp++;
+    if (*endp == '+')
+        g_watch_off = (uint32_t)strtoul(endp + 1, NULL, 0);
+
+    if (g_watch_derefs) {
+        fprintf(stderr, "  WATCH: resolving %u-deep chain from 0x%08X "
+                        "+0x%X\n", g_watch_derefs, g_watch_root, g_watch_off);
+        CloseHandle(CreateThread(NULL, 0, watch_resolver, NULL, 0, NULL));
+        return;
+    }
+    watch_arm(g_watch_root + g_watch_off);
+}
+
+static int watch_arm(uint32_t va)
+{
+    DWORD old;
+
+    g_watch_va = va;
+    if (!peek_readable(g_watch_va)) {
+        fprintf(stderr, "  WATCH: 0x%08X is not in a mapped window; "
+                        "not armed\n", g_watch_va);
+        return 0;
+    }
+    g_watch_last = *(const uint32_t *)((const uint8_t *)g_memory_offset
+                                       + g_watch_va);
+    /* The page holding the guest dword, in host terms. */
+    g_watch_page = (void *)(((uintptr_t)((const uint8_t *)g_memory_offset
+                                         + g_watch_va)) & ~(uintptr_t)4095);
+    g_watch_veh = AddVectoredExceptionHandler(1, watch_veh);
+    if (!g_watch_veh
+            || !VirtualProtect(g_watch_page, 4096, PAGE_READONLY, &old)) {
+        if (g_watch_veh) {
+            RemoveVectoredExceptionHandler(g_watch_veh);
+            g_watch_veh = NULL;
+        }
+        g_watch_page = NULL;
+        fprintf(stderr, "  WATCH: cannot trap 0x%08X; not armed\n",
+                g_watch_va);
+        return 0;
+    }
+    fprintf(stderr, "  WATCH: writes to the page of 0x%08X are trapped "
+                    "(current %08X)\n", g_watch_va, g_watch_last);
+    fflush(stderr);
+    return 1;
+}
+
 /* Arm the trap. Called once the MCPX aperture exists, and only alongside the
  * rest of RECOMP_AC97_READY: a title that never gets as far as resetting a
  * channel has nothing to gain from it, and the page fault costs something. */
@@ -416,6 +627,134 @@ static void ac97_arm_write_trap(void)
     fprintf(stderr, "  AC97: bus-master writes trapped at 0x%08X"
                     " (channel reset completes on write)\n",
             XBOX_MCPX_BASE + AC97_NABM_OFFSET);
+}
+
+/*
+ * Command words the DSP stub completes instantly. A bring-up probe, not a
+ * model.
+ *
+ * The GP and EP DSPs in src/apu are stubs -- effects bypass, encode
+ * passthrough -- and a stub that never completes is worse for a title than
+ * one that completes at once, because the title cannot get past it at all.
+ * DDS9 posts a command and waits for the DSP to clear it:
+ *
+ *     mov  [ebx], 3            ; ebx = scratch + 0x810
+ *   L: cmp  dword [ebx], 0
+ *     jne  L
+ *
+ * Unlike the AC'97 reset bit, this one re-reads every iteration, so clearing
+ * it from here is a race this side wins rather than loses.
+ *
+ * Why an environment variable rather than a registration API: the word's
+ * address is reached as *(*(*(this+8)+0x10)) + 0x810 from an object with no
+ * global anchor, and the APU never sees that address directly -- it reaches
+ * the block through the scatter-gather descriptors the title programmed. So
+ * the honest fix is for the GP stub to follow those descriptors, which is DSP
+ * work. This exists to answer, in one run and without that work, whether
+ * completing the command is in fact all the title is waiting for.
+ *
+ * RECOMP_DSP_ACK=0x804A8810[,...] -- up to 8 words, zeroed whenever non-zero.
+ */
+#define XBOX_MAX_DSP_ACK 8
+static uint32_t g_dsp_ack[XBOX_MAX_DSP_ACK];
+static int g_dsp_ack_count = 0;
+
+static void dsp_ack_init(void)
+{
+    const char *spec = getenv("RECOMP_DSP_ACK");
+    char buf[128], *q, *end;
+
+    if (!spec || !*spec)
+        return;
+    strncpy(buf, spec, sizeof buf - 1);
+    buf[sizeof buf - 1] = 0;
+    for (q = buf; *q && g_dsp_ack_count < XBOX_MAX_DSP_ACK; ) {
+        unsigned long va = strtoul(q, &end, 0);
+        if (end == q)
+            break;
+        g_dsp_ack[g_dsp_ack_count++] = (uint32_t)va;
+        q = (*end == ',') ? end + 1 : end;
+    }
+    if (g_dsp_ack_count)
+        fprintf(stderr, "  DSP ack: %d command word(s) will be completed"
+                        " immediately\n", g_dsp_ack_count);
+}
+
+static int fence_readable(uint32_t va, uint32_t bytes);  /* defined below */
+
+/* Hold a guest global at a value. A bring-up probe, like the DSP ack.
+ *
+ * There is exactly one reason this exists: to answer "is the title waiting on
+ * this?" in one run, before spending a day making the thing that would set it
+ * honestly. It is not a fix and must not be mistaken for one -- whatever it
+ * holds, nothing in the guest is producing, so the state it fakes is
+ * inconsistent with everything downstream of it by construction.
+ *
+ * RECOMP_POKE=0x30F234:1,0x30F238:1
+ */
+#define XBOX_MAX_POKE 8
+static struct { uint32_t va, value; } g_poke[XBOX_MAX_POKE];
+static int g_poke_count;
+
+static void poke_init(void)
+{
+    const char *spec = getenv("RECOMP_POKE");
+    char buf[192], *q, *end;
+
+    if (!spec || !*spec)
+        return;
+    strncpy(buf, spec, sizeof buf - 1);
+    buf[sizeof buf - 1] = 0;
+    for (q = buf; *q && g_poke_count < XBOX_MAX_POKE; ) {
+        unsigned long va = strtoul(q, &end, 0);
+        unsigned long val = 0;
+        if (end == q)
+            break;
+        if (*end == ':')
+            val = strtoul(end + 1, &end, 0);
+        g_poke[g_poke_count].va    = (uint32_t)va;
+        g_poke[g_poke_count].value = (uint32_t)val;
+        g_poke_count++;
+        q = (*end == ',') ? end + 1 : end;
+    }
+    if (g_poke_count)
+        fprintf(stderr, "  POKE: holding %d guest global(s) -- bring-up probe,"
+                        " not a fix\n", g_poke_count);
+}
+
+static void poke_tick(void)
+{
+    int i;
+
+    for (i = 0; i < g_poke_count; i++) {
+        if (!fence_readable(g_poke[i].va, 4))
+            continue;
+        {
+            volatile uint32_t *w = (volatile uint32_t *)
+                ((uintptr_t)g_poke[i].va + g_memory_offset);
+            if (*w != g_poke[i].value)
+                *w = g_poke[i].value;
+        }
+    }
+}
+
+static void dsp_ack_tick(void)
+{
+    int i;
+
+    for (i = 0; i < g_dsp_ack_count; i++) {
+        /* fence_readable rather than a bare bounds test: these land in the
+         * contiguous window, which a plain size check against the main map
+         * rejects. */
+        if (!fence_readable(g_dsp_ack[i], 4))
+            continue;
+        {
+            volatile uint32_t *w = (volatile uint32_t *)
+                ((uintptr_t)g_dsp_ack[i] + g_memory_offset);
+            if (*w)
+                *w = 0;
+        }
+    }
 }
 
 static const uint32_t MCPX_COUNTERS[] = {
@@ -762,16 +1101,21 @@ static DWORD WINAPI nv2a_ack_thread(LPVOID param)
                 *r |= NV2A_IDLE[i].idle_mask;
             }
         }
-        {
-            volatile uint32_t *put =
-                (volatile uint32_t *)((char *)regs + NV2A_USER_DMA_PUT);
-            volatile uint32_t *get =
-                (volatile uint32_t *)((char *)regs + NV2A_USER_DMA_GET);
-            if (*get != *put) {
-                *get = *put;
-            }
-        }
+        /* DMA_GET used to be set to DMA_PUT right here, before the scan
+         * below had executed anything. GET is what tells the title how far
+         * the GPU has consumed, and D3D waits on it before reusing the ring:
+         * reporting "all consumed" while the commands were still unread gave
+         * the title permission to overwrite them, and it did. The executor
+         * then read whatever part of the segment had survived, so every frame
+         * drew a different subset -- UI panels a few pixels off, a glyph in a
+         * different cell each frame. It looks like unstable geometry and is
+         * actually a lost-command race.
+         *
+         * The advance now happens after the scan, further down, which is also
+         * the only ordering that gives the title real back-pressure. */
         fence_mirrors_tick();
+        dsp_ack_tick();
+        poke_tick();
         counter_mirrors_tick();
         frame_counters_tick();
         framebuffer_probe_tick();
@@ -817,9 +1161,35 @@ static DWORD WINAPI nv2a_ack_thread(LPVOID param)
                      * The contiguous window IS the physical-address view, so
                      * OR-ing its base is the documented round trip, not a
                      * guess. */
-                    if (last_put && put > last_put)
+                    /* The pushbuffer is a ring, so PUT coming back below
+                     * where it was is a wrap, not a rewind. Scanning only
+                     * forward segments dropped everything written across the
+                     * seam -- one whole submission each time round -- which
+                     * is why a frame could be missing a panel or a glyph that
+                     * the previous one had.
+                     *
+                     * The ring's bounds are not published anywhere this code
+                     * can read, so they are learned: the lowest and highest
+                     * PUT ever seen bracket it. That is approximate on the
+                     * first lap and exact afterwards, and scanning a little
+                     * short of the true end costs the same commands that were
+                     * being lost anyway. */
+                    static uint32_t put_lo, put_hi;
+                    if (!put_lo || put < put_lo) put_lo = put;
+                    if (put > put_hi) put_hi = put;
+                    if (last_put && put > last_put) {
                         nv2a_pb_scan(XBOX_CONTIG_BASE | (last_put & 0x0FFFFFFFu),
                                      XBOX_CONTIG_BASE | (put      & 0x0FFFFFFFu));
+                    } else if (last_put && put < last_put) {
+                        if (put_hi > last_put)
+                            nv2a_pb_scan(
+                                XBOX_CONTIG_BASE | (last_put & 0x0FFFFFFFu),
+                                XBOX_CONTIG_BASE | (put_hi   & 0x0FFFFFFFu));
+                        if (put > put_lo)
+                            nv2a_pb_scan(
+                                XBOX_CONTIG_BASE | (put_lo & 0x0FFFFFFFu),
+                                XBOX_CONTIG_BASE | (put    & 0x0FFFFFFFu));
+                    }
                     /* Periodic, because what the title submits at init is not
                      * what it submits once it is drawing a menu, and the
                      * question the survey answers is about the latter. */
@@ -827,6 +1197,22 @@ static DWORD WINAPI nv2a_ack_thread(LPVOID param)
                         last_report = now_ms;
                         nv2a_pb_scan_report();
                     }
+                }
+                /* Consumed, now that it has actually been executed. A
+                 * wrap (put below last_put) leaves the tail of the ring
+                 * unscanned, so count those rather than pretend: a title
+                 * that wraps is still losing the segment across the seam. */
+                {
+                    volatile uint32_t *get =
+                        (volatile uint32_t *)((char *)regs + NV2A_USER_DMA_GET);
+                    static unsigned wraps;
+                    if (last_put && put < last_put && wraps++ < 8) {
+                        fprintf(stderr, "  [NV2A] pushbuffer wrapped "
+                                "(0x%08X -> 0x%08X); tail not scanned\n",
+                                last_put, put);
+                        fflush(stderr);
+                    }
+                    *get = put;
                 }
                 last_put = put; last_put_ms = now_ms;
                 /* GET as well as PUT. A title that stops submitting has either
@@ -882,6 +1268,8 @@ static DWORD WINAPI nv2a_ack_thread(LPVOID param)
 
 static void xbox_Nv2aAckStart(void)
 {
+    dsp_ack_init();
+    poke_init();
     g_nv2a_ack_stop = 0;
     g_nv2a_ack_thread = CreateThread(NULL, 0, nv2a_ack_thread,
                                      g_nv2a_memory, 0, NULL);
@@ -993,10 +1381,15 @@ void recomp_abi_violation_log(uint32_t va, uint32_t ebx0, uint32_t esi0,
 RECOMP_TLS uint32_t g_seh_ebp = 0;
 RECOMP_TLS double g_fp_stack[8];
 RECOMP_TLS int g_fp_top = 0;
+
+int g_force_return = 0;
 /* x87 control and status. The reset default masks every exception and
  * rounds to nearest, which is what the CRT expects before _control87. */
 RECOMP_TLS uint16_t g_fp_control_word = 0x037Fu;
 RECOMP_TLS int g_fp_cmp = 0;
+/* The x87 condition-code bits, as fnstsw reports them. Generated code that
+ * branches on a comparison reads these; a lifter that models them and a
+ * runtime that does not link. 0x4000 is C3 set, which is "equal". */
 RECOMP_TLS uint16_t g_fp_cc = 0x4000;
 
 /* Defined below, with the other guest registers. */
@@ -1120,6 +1513,22 @@ static int peek_readable(uint32_t va)
                 && (uint64_t)va + 4 <= (uint64_t)win[i].base + win[i].size)
             return 1;
     }
+
+    /* The RAM mirrors, which are as mapped as anything above.
+     *
+     * Leaving them out made the peek and the watch refuse addresses the
+     * title writes to every frame, and refuse them with "not in a mapped
+     * window" -- which reads as "that address is nonsense" when the truth
+     * was "this function does not know about that window". A fault at the
+     * top of the last mirror is exactly the kind of thing worth watching,
+     * and it was the one place the tool would not look. */
+    for (i = 0; i < XBOX_NUM_MIRRORS; i++) {
+        uint32_t base = XBOX_BASE_ADDRESS + (uint32_t)(i + 1) * XBOX_TOTAL_RAM;
+        if (!g_mirror_views[i])
+            continue;
+        if (va >= base && (uint64_t)va + 4 <= (uint64_t)base + XBOX_TOTAL_RAM)
+            return 1;
+    }
     return 0;
 }
 
@@ -1140,18 +1549,359 @@ void xbox_PeekSample(const char *label)
     buf[sizeof buf - 1] = 0;
     fprintf(stderr, "  %s:", label ? label : "peek");
     for (q = buf; *q; ) {
-        unsigned long va = strtoul(q, &end, 0);
+        /* "[[0x006DF414]]+0x14" follows two pointers and adds an offset.
+         * The fields worth watching during bring-up are usually inside heap
+         * objects whose addresses change run to run but which are always
+         * reachable from a static one, and a peek that cannot follow a
+         * pointer cannot see them at all. */
+        unsigned derefs = 0, k;
+        unsigned long va;
+        uint32_t a;
+        int ok = 1;
+
+        while (*q == '[') { derefs++; q++; }
+        va = strtoul(q, &end, 0);
         if (end == q)
             break;
-        if (peek_readable((uint32_t)va))
-            fprintf(stderr, " [%08lX]=%08X", va,
-                    *(const uint32_t *)(mem + va));
+        while (*end == ']')
+            end++;
+        a = (uint32_t)va;
+        for (k = 0; k < derefs && ok; k++) {
+            if (!peek_readable(a) || !(a = *(const uint32_t *)(mem + a)))
+                ok = 0;
+        }
+        if (*end == '+')
+            a += (uint32_t)strtoul(end + 1, &end, 0);
+        if (ok && peek_readable(a))
+            fprintf(stderr, " [%08X]=%08X", a, *(const uint32_t *)(mem + a));
         else
-            fprintf(stderr, " [%08lX]=??", va);
+            fprintf(stderr, " [%08X]=??", a);
         q = (*end == ',') ? end + 1 : end;
     }
     fprintf(stderr, "\n");
     fflush(stderr);
+}
+
+/* RECOMP_PAD_INJECT=<va>[,<mask>[,<period_ms>]]: OR a button mask straight
+ * into the guest's own pad buffer.
+ *
+ * The USB side is not the question this answers. Reports reach the guest at
+ * 100/s, but the title latches *new presses* into its pad array and its
+ * consumers clear the bits, so a press only counts if it lands between the
+ * latch and the read. That makes everything downstream of the input path --
+ * the title's state machine, the menu it opens -- untestable while the input
+ * path is being worked on.
+ *
+ * Setting the bit directly separates the two: if the menu opens with this on,
+ * the remaining bug is entirely in how a press reaches the buffer. It is a
+ * bring-up probe, like RECOMP_SKIP_FMV, and off unless the variable is set.
+ *
+ * For Shin Megami Tensei: Nine the pad array is at 0x006795C8, stride 0xE8,
+ * with the button word at +0x48 -- so slot 0 is 0x00679610 and START is 0x10.
+ */
+static uint32_t s_inject_va;
+static unsigned s_inject_mask, s_inject_period;
+
+/* With mask 0 the thread sweeps instead: bit 0, then bit 1, and so on, each
+ * held for s_inject_sweep_ms. Which bit is A and which is a direction is not
+ * written down anywhere this project can read, and sweeping answers it in one
+ * run rather than sixteen. The bit in force is printed so a frame capture can
+ * be matched back to it. */
+static unsigned s_inject_sweep_ms;
+
+/* RECOMP_PAD_SCRIPT="<ms>:<mask>,<ms>:<mask>,..." -- a timed button sequence.
+ *
+ * Sweeping every bit in turn is how the button map gets discovered, but it
+ * cannot drive a menu: reaching a screen takes a specific order of presses
+ * with gaps between them. A script does, and it is repeatable, which a sweep
+ * is not. Mask 0 is a gap with nothing held.
+ *
+ * Example: "1500:0x08,300:0,1500:0x08,300:0,2000:0x100,500:0,2000:0x10"
+ * holds right, releases, right again, then whatever 0x100 turns out to be,
+ * then START. */
+/* RECOMP_PAD_INJECT_A=<va>: a second target for the script.
+ *
+ * On Xbox only the d-pad, START, BACK and the thumbs live in wButtons; A, B,
+ * X and Y are separate analog bytes after it. Measured, this title consumes
+ * only START (0x10) from the button word -- injecting all sixteen bits shows
+ * exactly one selective clear, 0xFFFF -> 0xFFEF -- so the keyboard's confirm
+ * cannot be reached through that address at all. A script step whose mask has
+ * bit 16 set writes the low half to this address instead. */
+static uint32_t s_inject_va2;
+
+#define PAD_SCRIPT_MAX 32
+static struct { unsigned ms, mask; } s_script[PAD_SCRIPT_MAX];
+static int s_script_len;
+/* RECOMP_PAD_INJECT_STOP=<ms>: stop injecting after this long.
+ *
+ * Injection is how a run reaches a screen without a person at the pad, but
+ * leaving it on means the title keeps being driven -- with a sweep it cycles
+ * a different button every few seconds and the UI never settles, which looks
+ * exactly like the display flickering and is not. Stopping once the screen
+ * under test is reached leaves the title alone. */
+static unsigned s_inject_stop_ms;
+
+/* RECOMP_PAD_WATCH=<va> -- read a guest word and print it when it changes.
+ *
+ * Read-only, unlike the injection below. It answers the question that
+ * separates "we did not deliver the button" from "the title was handed it
+ * and did nothing": the USB report can carry START correctly while the
+ * title's own pad struct never receives it, and from outside those two
+ * look identical.
+ */
+static DWORD WINAPI xbox_pad_watch_thread(LPVOID unused)
+{
+    const uint8_t *mem = (const uint8_t *)g_memory_offset;
+    char *e;
+    uint32_t va = (uint32_t)strtoul(getenv("RECOMP_PAD_WATCH"), &e, 0);
+    /* An optional byte count scans a range instead of one word, which is
+     * what "the button went somewhere, but where" needs: the pad array has
+     * four slots and watching only the first cannot tell an undelivered
+     * button from one delivered to the wrong player. */
+    uint32_t span = (*e == ',') ? (uint32_t)strtoul(e + 1, NULL, 0) : 4u;
+    uint32_t words = span / 4u ? span / 4u : 1u;
+    static uint32_t last[512];
+    unsigned long t0 = (unsigned long)GetTickCount();
+    unsigned n = 0, i;
+
+    (void)unused;
+    if (words > 512) words = 512;
+    for (i = 0; i < words; i++)
+        memcpy(&last[i], mem + va + i * 4, 4);
+    for (;;) {
+        Sleep(8);
+        for (i = 0; i < words && n < 80; i++) {
+            uint32_t v;
+            memcpy(&v, mem + va + i * 4, 4);
+            if (v != last[i]) {
+                last[i] = v;
+                if (v) {
+                    n++;
+                    fprintf(stderr, "  [PADW] %08X = %08X  (+%lu ms)\n",
+                            va + i * 4, v,
+                            (unsigned long)GetTickCount() - t0);
+                    fflush(stderr);
+                }
+            }
+        }
+    }
+}
+
+static DWORD WINAPI xbox_pad_inject_thread(LPVOID unused)
+{
+    uint8_t *mem = (uint8_t *)g_memory_offset;
+    unsigned bit = 0;
+    unsigned long t0 = (unsigned long)GetTickCount();
+    const unsigned long t_start = t0;
+
+    (void)unused;
+    for (;;) {
+        unsigned mask = s_inject_mask;
+
+        Sleep(s_inject_period);
+        if (s_inject_stop_ms
+                && (unsigned long)GetTickCount() - t_start > s_inject_stop_ms) {
+            static int said;
+            if (!said) {
+                said = 1;
+                fprintf(stderr, "  PAD INJECT: stopping after %u ms\n",
+                        s_inject_stop_ms);
+                fflush(stderr);
+            }
+            continue;
+        }
+        if (s_script_len) {
+            unsigned long el = (unsigned long)GetTickCount() - t_start;
+            unsigned long acc = 0;
+            int i, found = -1;
+            for (i = 0; i < s_script_len; i++) {
+                if (el < acc + s_script[i].ms) { found = i; break; }
+                acc += s_script[i].ms;
+            }
+            if (found < 0) {
+                static int said;
+                if (!said) {
+                    said = 1;
+                    fprintf(stderr, "  PAD SCRIPT: finished\n");
+                    fflush(stderr);
+                }
+                continue;                 /* past the end: hands off */
+            }
+            {
+                static int last = -1;
+                if (found != last) {
+                    last = found;
+                    fprintf(stderr, "  PAD SCRIPT: step %d -> 0x%04X\n",
+                            found, s_script[found].mask);
+                    fflush(stderr);
+                }
+            }
+            mask = s_script[found].mask;
+            if (!(mask & 0xFFFFu))
+                continue;
+            /* Bit 17 makes the step a single press rather than a hold.
+             *
+             * Injection re-ORs its mask every period, so a 900 ms step at a
+             * 16 ms period is not one press but about fifty-six. A menu
+             * reading edges then advances an unpredictable number of times,
+             * which is why the same script reached a different screen on
+             * each run. One write per step is what a button press is. */
+            if (mask & 0x20000u) {
+                static int pulsed = -1;
+                if (pulsed == found)
+                    continue;
+                pulsed = found;
+            }
+            if ((mask & 0x10000u) && s_inject_va2) {
+                if (peek_readable(s_inject_va2))
+                    *(uint16_t *)(mem + s_inject_va2) |= (uint16_t)mask;
+                continue;
+            }
+        } else if (s_inject_sweep_ms) {
+            unsigned long now = (unsigned long)GetTickCount();
+            if (now - t0 >= s_inject_sweep_ms) {
+                t0 = now;
+                bit = (bit + 1u) & 15u;
+                fprintf(stderr, "  PAD INJECT: now bit %u (0x%04X)\n",
+                        bit, 1u << bit);
+                fflush(stderr);
+            }
+            /* Kept alongside the swept bit, not instead of it: reaching the
+             * screen under test needs START held, and replacing the mask
+             * dropped it the moment the sweep began. */
+            mask = s_inject_mask | (1u << bit);
+        }
+        /* peek_readable, not a bare write: the buffer is a guest address from
+         * an environment variable, and a typo must not fault the process. */
+        if (peek_readable(s_inject_va))
+            *(uint16_t *)(mem + s_inject_va) |= (uint16_t)mask;
+    }
+}
+
+static void xbox_start_pad_inject(void)
+{
+    const char *spec = getenv("RECOMP_PAD_INJECT");
+    char *end;
+    HANDLE h;
+
+    /* Independent of the injection below: watching is useful precisely when
+     * nothing is being injected. Registering it after that guard meant it
+     * only ran alongside the probe whose effects it exists to rule out. */
+    if (getenv("RECOMP_PAD_WATCH") && g_memory_offset) {
+        HANDLE w = CreateThread(NULL, 0, xbox_pad_watch_thread, NULL, 0, NULL);
+        if (w) CloseHandle(w);
+    }
+
+    if (!spec || !*spec || g_memory_base == NULL)
+        return;
+    s_inject_va = (uint32_t)strtoul(spec, &end, 0);
+    s_inject_mask = (*end == ',') ? (unsigned)strtoul(end + 1, &end, 0) : 0x10u;
+    s_inject_period = (*end == ',') ? (unsigned)strtoul(end + 1, &end, 0) : 16u;
+    s_inject_sweep_ms = (*end == ',') ? (unsigned)strtoul(end + 1, &end, 0) : 0u;
+    {
+        const char *stop = getenv("RECOMP_PAD_INJECT_STOP");
+        const char *scr = getenv("RECOMP_PAD_SCRIPT");
+        const char *a2 = getenv("RECOMP_PAD_INJECT_A");
+        s_inject_va2 = a2 ? (uint32_t)strtoul(a2, NULL, 0) : 0u;
+        s_inject_stop_ms = stop ? (unsigned)strtoul(stop, NULL, 0) : 0u;
+        if (scr && *scr) {
+            const char *q = scr;
+            while (*q && s_script_len < PAD_SCRIPT_MAX) {
+                char *e;
+                unsigned ms = (unsigned)strtoul(q, &e, 0);
+                unsigned mk = (*e == ':') ? (unsigned)strtoul(e + 1, &e, 0) : 0u;
+                s_script[s_script_len].ms = ms;
+                s_script[s_script_len].mask = mk;
+                s_script_len++;
+                q = (*e == ',') ? e + 1 : e;
+            }
+            fprintf(stderr, "  PAD SCRIPT: %d steps\n", s_script_len);
+        }
+    }
+    if (!s_inject_va || (!s_inject_mask && !s_inject_sweep_ms
+                         && !s_script_len))
+        return;
+    if (!s_inject_period)
+        s_inject_period = 16u;
+    if (s_inject_sweep_ms)
+        fprintf(stderr, "  PAD INJECT: sweeping bits 0..15 into [%08X],"
+                " %u ms each, every %u ms\n",
+                s_inject_va, s_inject_sweep_ms, s_inject_period);
+    else
+        fprintf(stderr, "  PAD INJECT: OR 0x%04X into [%08X] every %u ms\n",
+                s_inject_mask, s_inject_va, s_inject_period);
+    fflush(stderr);
+    h = CreateThread(NULL, 0, xbox_pad_inject_thread, NULL, 0, NULL);
+    if (h)
+        CloseHandle(h);
+}
+
+/* RECOMP_MEMDIFF="<va>,<bytes>,<ms1>,<ms2>": which guest dwords a button
+ * changed.
+ *
+ * "Find the variable this press moved" is not answerable by reading the
+ * disassembly when the handler cannot be located by grep -- several
+ * functions test the same pad byte and most of them are not the one on
+ * screen. Two snapshots around the press, differenced, name it directly.
+ * Run it once with the press and once without: whatever changes in both is
+ * an animation counter, and whatever changes only with the press is the
+ * thing the button drives.
+ */
+static uint32_t s_md_va, s_md_len, s_md_t1, s_md_t2;
+
+static DWORD WINAPI xbox_memdiff_thread(LPVOID unused)
+{
+    const uint8_t *mem = (const uint8_t *)g_memory_offset;
+    uint8_t *a, *b;
+    uint32_t i, n = 0;
+
+    (void)unused;
+    a = (uint8_t *)malloc(s_md_len);
+    b = (uint8_t *)malloc(s_md_len);
+    if (!a || !b)
+        return 0;
+    Sleep(s_md_t1);
+    if (!peek_readable(s_md_va)) {
+        fprintf(stderr, "  MEMDIFF: 0x%08X not readable\n", s_md_va);
+        return 0;
+    }
+    memcpy(a, mem + s_md_va, s_md_len);
+    Sleep(s_md_t2 > s_md_t1 ? s_md_t2 - s_md_t1 : 1000);
+    memcpy(b, mem + s_md_va, s_md_len);
+
+    fprintf(stderr, "  MEMDIFF: 0x%08X..0x%08X between %ums and %ums\n",
+            s_md_va, s_md_va + s_md_len, s_md_t1, s_md_t2);
+    for (i = 0; i + 4 <= s_md_len; i += 4) {
+        uint32_t x, y;
+        memcpy(&x, a + i, 4);
+        memcpy(&y, b + i, 4);
+        if (x != y && n++ < 60)
+            fprintf(stderr, "  MEMDIFF   [%08X] %08X -> %08X\n",
+                    s_md_va + i, x, y);
+    }
+    fprintf(stderr, "  MEMDIFF: %u dwords changed\n", n);
+    fflush(stderr);
+    free(a); free(b);
+    return 0;
+}
+
+static void xbox_start_memdiff(void)
+{
+    const char *spec = getenv("RECOMP_MEMDIFF");
+    char *e;
+    HANDLE h;
+
+    if (!spec || !*spec || g_memory_base == NULL)
+        return;
+    s_md_va  = (uint32_t)strtoul(spec, &e, 0);
+    s_md_len = (*e == ',') ? (uint32_t)strtoul(e + 1, &e, 0) : 0x10000u;
+    s_md_t1  = (*e == ',') ? (uint32_t)strtoul(e + 1, &e, 0) : 50000u;
+    s_md_t2  = (*e == ',') ? (uint32_t)strtoul(e + 1, &e, 0) : 55000u;
+    if (!s_md_va || !s_md_len)
+        return;
+    h = CreateThread(NULL, 0, xbox_memdiff_thread, NULL, 0, NULL);
+    if (h)
+        CloseHandle(h);
 }
 
 static DWORD WINAPI xbox_watchdog_thread(LPVOID unused)
@@ -1197,6 +1947,7 @@ static DWORD WINAPI xbox_watchdog_thread(LPVOID unused)
      * CPU loop polling a global is exactly the case neither of those covers.
      */
     xbox_PeekSample("peek");
+    xbox_OhciReport();
     /* The pushbuffer pointers, unconditionally.
      *
      * "Extend the table as more handshakes turn up -- run the title and the
@@ -1236,6 +1987,12 @@ static DWORD WINAPI xbox_watchdog_thread(LPVOID unused)
 void xbox_WatchdogStart(void)
 {
     const char *secs = getenv("RECOMP_WATCHDOG_SECS");
+
+    /* Before the early return below: the injection probe has nothing to do
+     * with the watchdog and must not need it switched on. */
+    xbox_start_pad_inject();
+    xbox_start_memdiff();
+
     HANDLE h;
 
     if (!secs || !*secs)
@@ -1281,6 +2038,7 @@ volatile uint64_t g_icall_count = 0;
 
 BOOL xbox_MemoryLayoutInit(const void *xbe_data, size_t xbe_size)
 {
+    g_force_return = getenv("RECOMP_FORCE_RETURN") != NULL;
     DWORD old_protect;
     const uint8_t *xbe = (const uint8_t *)xbe_data;
 
@@ -1343,31 +2101,7 @@ BOOL xbox_MemoryLayoutInit(const void *xbe_data, size_t xbe_size)
             0,                      /* sentinel - let OS choose */
         };
 
-        /* Iterate the whole array, sentinel included. The old condition
-         * (try_bases[i] != 0 || i == 0) stopped *at* the zero rather than
-         * using it, so the "let the OS choose" fallback never ran: the loop
-         * tried the fixed addresses and gave up. Invisible on Windows, where
-         * one of the low bases succeeds -- fatal on arm64 macOS, where all of
-         * them sit inside the 4 GB __PAGEZERO segment and none can. */
-        /* Reserve base + mirrors as one range, and map the base at its head.
-         * VirtualFree releases just the slice about to be used, so each view
-         * replaces our own reservation rather than racing for free space. */
-        g_span_size = g_memory_size * (size_t)(1 + XBOX_NUM_MIRRORS);
-        g_span_base = VirtualAlloc(NULL, g_span_size, MEM_RESERVE, PAGE_NOACCESS);
-        if (g_span_base) {
-            VirtualFree(g_span_base, g_memory_size, MEM_RELEASE);
-            g_memory_base = MapViewOfFileEx(g_mapping_handle,
-                                            FILE_MAP_ALL_ACCESS, 0, 0,
-                                            g_memory_size, g_span_base);
-            if (!g_memory_base) {
-                VirtualFree(g_span_base, g_span_size, MEM_RELEASE);
-                g_span_base = NULL;
-                g_span_size = 0;
-            }
-        }
-
-        const size_t n_bases = sizeof(try_bases) / sizeof(try_bases[0]);
-        for (size_t i = 0; !g_memory_base && i < n_bases; i++) {
+        for (int i = 0; try_bases[i] != 0 || i == 0; i++) {
             LPVOID hint = try_bases[i] ? (LPVOID)try_bases[i] : NULL;
             g_memory_base = MapViewOfFileEx(
                 g_mapping_handle,
@@ -1424,38 +2158,9 @@ BOOL xbox_MemoryLayoutInit(const void *xbe_data, size_t xbe_size)
      * Best-effort: failing to protect it costs only the diagnostic. */
     if (XBOX_MAP_START == 0 && getenv("RECOMP_TRAP_NULL")) {
         DWORD old_protect;
-        /* Protection is applied at host page granularity, and the host page
-         * is not always the guest's 4 KB -- Apple Silicon uses 16 KB, so this
-         * 0x1000 request actually covers guest 0..0x3FFF. That is why
-         * XBOX_TIB_MAIN sits at 0x4000: the widest page any supported host
-         * uses fits below the TIB, so the rounding costs nothing and the
-         * guard installs everywhere.
-         *
-         * The check below is what remains of an earlier bug rather than dead
-         * code. With the TIB at 0x1000 the rounding reached it, init wrote the
-         * TIB moments later, and every run that asked for the guard died at
-         * startup -- so the guard disabled itself on all of Apple Silicon and
-         * the diagnostic silently did nothing. It stays as a floor for a host
-         * with pages wider than the TIB offset, where skipping really is
-         * better than breaking the run. */
-#if defined(_WIN32)
-        SYSTEM_INFO si;
-        long host_page;
-        GetSystemInfo(&si);
-        host_page = (long)si.dwPageSize;
-#else
-        long host_page = sysconf(_SC_PAGESIZE);
-#endif
-        if (host_page > 0 && (uint32_t)host_page > XBOX_TIB_MAIN) {
-            fprintf(stderr, "  RECOMP_TRAP_NULL: not available -- the host page "
-                    "is %ld bytes, so trapping guest page zero would also trap "
-                    "the TIB at 0x%08X\n", host_page, XBOX_TIB_MAIN);
-        } else {
-            if (VirtualProtect(g_memory_base, 0x1000, PAGE_NOACCESS, &old_protect)) {
-                fprintf(stderr, "  guest page 0 is PAGE_NOACCESS"
-                                " (null dereferences fault)\n");
-            }
-        }
+        if (VirtualProtect(g_memory_base, 0x1000, PAGE_NOACCESS, &old_protect))
+            fprintf(stderr, "  guest page 0 is PAGE_NOACCESS"
+                            " (null dereferences fault)\n");
     }
 
     if (g_memory_offset == 0) {
@@ -1513,7 +2218,6 @@ BOOL xbox_MemoryLayoutInit(const void *xbe_data, size_t xbe_size)
         DWORD sect_headers_va = *(const DWORD *)(xbe + XBE_SECTION_HEADERS_OFFSET);
         DWORD sect_headers_off = sect_headers_va - base_addr;
         int sections_loaded = 0;
-        int sections_short = 0;
         size_t total_bytes = 0;
 
         if (num_sections > 64) num_sections = 64;  /* sanity cap */
@@ -1547,27 +2251,9 @@ BOOL xbox_MemoryLayoutInit(const void *xbe_data, size_t xbe_size)
             /* Zero the full virtual size first (handles BSS) */
             memset(XBOX_VA(sec_va), 0, sec_vsize);
 
-            /*
-             * Copy initialized data from XBE.
-             *
-             * A section whose raw data runs past the end of the buffer is a
-             * truncated or corrupt image, not a BSS section, and it must not
-             * be counted among the sections loaded. Reporting it as loaded is
-             * how a 4MB title read through a 1MB buffer produced "Loaded
-             * 17/17 sections" with every byte of every section still zero --
-             * including the kernel thunk table, which then resolved 0 imports
-             * and looked like a title that calls no kernel functions.
-             */
-            int have_data = (copy_size == 0) ||
-                            (sec_raw_off + copy_size <= xbe_size);
-            if (copy_size > 0 && have_data) {
+            /* Copy initialized data from XBE */
+            if (copy_size > 0 && sec_raw_off + copy_size <= xbe_size) {
                 memcpy(XBOX_VA(sec_va), xbe + sec_raw_off, copy_size);
-            } else if (!have_data) {
-                fprintf(stderr,
-                        "  WARNING: section %u (%s) raw data 0x%08X+%u runs past "
-                        "the %zu-byte image -- left zeroed\n",
-                        si, sec_name, sec_raw_off, copy_size, xbe_size);
-                sections_short++;
             }
 
             /* Every loaded section, executable or not. Anything that writes
@@ -1589,10 +2275,8 @@ BOOL xbox_MemoryLayoutInit(const void *xbe_data, size_t xbe_size)
                     g_xbox_code_hi = sec_va + sec_vsize;
             }
 
-            if (have_data) {
-                sections_loaded++;
-                total_bytes += copy_size;
-            }
+            sections_loaded++;
+            total_bytes += copy_size;
 
             fprintf(stderr, "  [%2u] %-12s VA=0x%08X vsize=%-8u raw=0x%08X rsize=%-8u%s\n",
                     si, sec_name, sec_va, sec_vsize, sec_raw_off, sec_raw_size,
@@ -1601,12 +2285,6 @@ BOOL xbox_MemoryLayoutInit(const void *xbe_data, size_t xbe_size)
 
         fprintf(stderr, "  Loaded %d/%u sections (%zu bytes total)\n",
                 sections_loaded, num_sections, total_bytes);
-        if (sections_short) {
-            fprintf(stderr,
-                    "  ERROR: %d section(s) had no data in the image -- the XBE "
-                    "is truncated or was read short; the title will not run\n",
-                    sections_short);
-        }
     }
 
     /*
@@ -2090,7 +2768,27 @@ BOOL xbox_MemoryLayoutInit(const void *xbe_data, size_t xbe_size)
         uint64_t tiled_lo = XBOX_TILED_BASE;
         uint64_t tiled_hi = tiled_lo + xbox_TiledApertureSize();
 
-        for (int m = 0; m < XBOX_NUM_MIRRORS; m++) {
+        /* How many mirrors to map. RECOMP_RAM_MIRRORS caps it.
+         *
+         * The mirrors emulate the address wrap a title may rely on, and they
+         * also make a runaway write survivable for 1.8 GB before it finds an
+         * unmapped page. That turns a small bug into a rampage: by the time
+         * the fault arrives it has overwritten the guest stack, so the crash
+         * report has no frame to walk and names nothing. Capping them puts
+         * the fault back near the end of real RAM, where the stack is still
+         * intact and the report is worth reading.
+         *
+         * Default is unchanged. This is a diagnostic knob, not a policy. */
+        int mirror_limit = XBOX_NUM_MIRRORS;
+        {
+            const char *spec = getenv("RECOMP_RAM_MIRRORS");
+            if (spec) {
+                int n = atoi(spec);
+                if (n >= 0 && n < XBOX_NUM_MIRRORS)
+                    mirror_limit = n;
+            }
+        }
+        for (int m = 0; m < mirror_limit; m++) {
             uintptr_t mirror_base = (uintptr_t)g_memory_base +
                                     (uintptr_t)(m + 1) * g_memory_size;
             uint64_t guest_lo = (uint64_t)(m + 1) * g_memory_size;
@@ -2102,11 +2800,6 @@ BOOL xbox_MemoryLayoutInit(const void *xbe_data, size_t xbe_size)
                         m + 1, (unsigned)XBOX_TILED_BASE);
                 continue;
             }
-            /* Inside the reservation this hands back the slice we are about
-             * to use; outside it (no reservation) this is a no-op on an
-             * address we never held. */
-            if (g_span_base)
-                VirtualFree((LPVOID)mirror_base, g_memory_size, MEM_RELEASE);
             g_mirror_views[m] = MapViewOfFileEx(
                 g_mapping_handle,
                 FILE_MAP_ALL_ACCESS,
@@ -2122,7 +2815,7 @@ BOOL xbox_MemoryLayoutInit(const void *xbe_data, size_t xbe_size)
             }
         }
         fprintf(stderr, "  RAM mirror: %d/%d views mapped (covers %d MB)\n",
-                mirrors_ok, XBOX_NUM_MIRRORS,
+                mirrors_ok, mirror_limit,
                 (int)((mirrors_ok + 1) * g_memory_size / (1024 * 1024)));
     }
 
@@ -2210,6 +2903,7 @@ BOOL xbox_MemoryLayoutInit(const void *xbe_data, size_t xbe_size)
         }
     }
 
+    xbox_WatchInit();
     fprintf(stderr, "xbox_MemoryLayoutInit: complete\n");
     return TRUE;
 }
@@ -2272,40 +2966,10 @@ void xbox_MemoryLayoutShutdown(void)
         g_memory_base = NULL;
         g_memory_size = 0;
     }
-    /* The apertures. Left mapped, a second init cannot place them: the first
-     * run still owns 0x80000000, 0xFD000000, 0xFE800000, 0xFF000000 and the
-     * tiled alias, and every one of those comes back as "failed" while init
-     * still returns TRUE because they are best-effort. The result is a layout
-     * that looks initialised and has no device apertures at all. */
-    if (g_tiled_view) {
-        UnmapViewOfFile(g_tiled_view);
-        g_tiled_view = NULL;
-    }
-    if (g_contig_memory) {
-        VirtualFree(g_contig_memory, 0, MEM_RELEASE);
-        g_contig_memory = NULL;
-    }
-    if (g_mcpx_memory) {
-        VirtualFree(g_mcpx_memory, 0, MEM_RELEASE);
-        g_mcpx_memory = NULL;
-    }
-    if (g_flash_memory) {
-        VirtualFree(g_flash_memory, 0, MEM_RELEASE);
-        g_flash_memory = NULL;
-    }
-
     /* Close file mapping handle */
     if (g_mapping_handle) {
         CloseHandle(g_mapping_handle);
         g_mapping_handle = NULL;
-    }
-
-    /* Whatever is left of the base+mirrors reservation. The views carved out
-     * of it are already unmapped above; this releases the range itself. */
-    if (g_span_base) {
-        VirtualFree(g_span_base, g_span_size, MEM_RELEASE);
-        g_span_base = NULL;
-        g_span_size = 0;
     }
     fprintf(stderr, "xbox_MemoryLayoutShutdown: released\n");
 }

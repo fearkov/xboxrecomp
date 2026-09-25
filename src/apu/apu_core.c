@@ -19,6 +19,7 @@
  * License along with this library; if not, see <http://www.gnu.org/licenses/>.
  */
 
+#include <stdlib.h>
 #include "apu_state.h"
 #include "apu.h"
 #include "apu_xaudio2.h"
@@ -58,8 +59,31 @@ void mcpx_debug_end_frame(void) {}
  * IRQ handling (stubbed - no PCI bus in standalone)
  * ============================================================ */
 
+/* Non-zero while the APU's interrupt line is asserted. Read by the kernel's
+ * timer thread, which is the only one that can call into guest code. */
+volatile int g_apu_irq_asserted;
+
 static void update_irq(MCPXAPUState *d)
 {
+    /* What the guest has actually programmed. The assert below needs the
+     * global enable set and some enabled source pending; if neither ever
+     * happens there is nothing to deliver, and that is a different problem
+     * from a delivery that is not wired. */
+    if (getenv("RECOMP_APU_IRQ_TRACE")) {
+        static uint32_t last_ien, last_ists, last_fectl;
+        static unsigned n;
+        uint32_t ien = d->regs[NV_PAPU_IEN];
+        uint32_t ists = d->regs[NV_PAPU_ISTS];
+        uint32_t fectl = d->regs[NV_PAPU_FECTL];
+        if ((ien != last_ien || ists != last_ists || fectl != last_fectl)
+            && n++ < 30) {
+            fprintf(stderr, "  [APUIRQ] IEN=%08X ISTS=%08X FECTL=%08X\n",
+                    ien, ists, fectl);
+            fflush(stderr);
+            last_ien = ien; last_ists = ists; last_fectl = fectl;
+        }
+    }
+
     if (d->regs[NV_PAPU_FECTL] & NV_PAPU_FECTL_FEMETHMODE_TRAPPED) {
         qatomic_or(&d->regs[NV_PAPU_ISTS], NV_PAPU_ISTS_FETINTSTS);
     }
@@ -67,11 +91,22 @@ static void update_irq(MCPXAPUState *d)
         ((d->regs[NV_PAPU_ISTS] & ~NV_PAPU_ISTS_GINTSTS) &
          d->regs[NV_PAPU_IEN])) {
         qatomic_or(&d->regs[NV_PAPU_ISTS], NV_PAPU_ISTS_GINTSTS);
-        /* In standalone mode we don't raise a PCI IRQ; the game's kernel
-         * stub will poll ISTS directly or we'll signal via a flag. */
+        /* There is no PCI bus here, so the line is raised by handing the
+         * kernel a flag instead. It cannot be delivered from this thread:
+         * the interrupt service routine is guest code and needs a guest
+         * stack and TIB, which only the timer thread has. So this records
+         * that the line is asserted and that thread delivers it.
+         *
+         * Without this the ISR never runs, and on Shin Megami Tensei: Nine
+         * that is not merely silence -- the title busy-waits on a flag its
+         * audio ISR is what clears, so every wait costs a half-second
+         * timeout spent spinning at DISPATCH_LEVEL, which starves the USB
+         * polling that shares it. */
+        g_apu_irq_asserted = 1;
         pci_irq_assert(PCI_DEVICE(d));
     } else {
         qatomic_and(&d->regs[NV_PAPU_ISTS], ~NV_PAPU_ISTS_GINTSTS);
+        g_apu_irq_asserted = 0;
         pci_irq_deassert(PCI_DEVICE(d));
     }
 }

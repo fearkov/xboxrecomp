@@ -368,6 +368,14 @@ _FLAGS_UNDEFINED = frozenset({
 })
 
 # Instructions that do NOT modify EFLAGS (preserve flag tracking)
+# x87 instructions that write EFLAGS (the rest only touch the FPU status word).
+_X87_EFLAGS_WRITERS = frozenset(("fcomi", "fcomip", "fucomi", "fucomip", "fcompi", "fucompi"))
+
+
+def _x87_keeps_eflags(m):
+    return m.startswith("f") and m not in _X87_EFLAGS_WRITERS
+
+
 _EFLAGS_PRESERVE = frozenset({
     # General-purpose data movement / stack
     "mov", "lea", "push", "pop", "nop", "leave", "ret",
@@ -432,6 +440,164 @@ _EFLAGS_PRESERVE = frozenset({
 })
 
 
+# Setters whose ZF and SF both come from the result at the destination's width.
+RESULT_ZF_SETTERS = frozenset(("and", "or", "xor", "add", "sub", "inc", "dec", "neg"))
+
+# What a result join may carry ahead of its flag reader: none of these touches
+# EFLAGS, and the join is refused if one of them writes the result register.
+_RESJOIN_PASSTHROUGH = frozenset(("mov", "movzx", "movsx", "lea", "push", "nop"))
+
+_REG_FAMILY = {reg: full for full, regs in (
+    ("eax", ("al", "ah", "ax", "eax")), ("ebx", ("bl", "bh", "bx", "ebx")),
+    ("ecx", ("cl", "ch", "cx", "ecx")), ("edx", ("dl", "dh", "dx", "edx")),
+    ("esi", ("si", "esi")), ("edi", ("di", "edi")),
+    ("ebp", ("bp", "ebp")), ("esp", ("sp", "esp"))) for reg in regs}
+
+
+# Join snapshots. When a join's predecessors set the flags with different
+# operations (MSVC's `x % 2`: `and` on one edge, `inc` on the other, then the
+# join rewrites the register before its `je`), each predecessor's setter also
+# records a normalized pair in _ja/_jb such that the flags equal those of
+# `cmp _ja, _jb` at the setter's width: cmp/sub (a, b), test (a & b, 0), the
+# rest (result, 0). The join's jcc then uses the cmp lowering on the pair.
+# CF and OF match only for cmp/sub (exact) and test/and/or/xor (both 0); after
+# add/inc/dec/neg only ZF and SF do (inc/dec leave CF alone).
+JSNAP_EXACT = frozenset(("cmp", "sub", "test", "and", "or", "xor"))
+JSNAP_ZS = frozenset(("add", "inc", "dec", "neg"))
+_JSNAP_ZS_JCC = frozenset(("je", "jz", "jne", "jnz", "js", "jns"))
+_JSNAP_EXACT_JCC = _JSNAP_ZS_JCC | frozenset((
+    "jl", "jnge", "jge", "jnl", "jle", "jng", "jg", "jnle",
+    "jb", "jnae", "jc", "jae", "jnb", "jnc", "jbe", "jna", "ja", "jnbe"))
+
+
+def _jsnap_stmts(insn):
+    """The _ja/_jb pair for insn (see JSNAP_EXACT). cmp/sub read their
+    operands, so a sub's pair is emitted before it; the rest read the result."""
+    ops = insn.operands
+    w = _operand_width(ops[0]) or (_operand_width(ops[1]) if len(ops) > 1 else None) or 4
+    mask = {1: "0xFFu", 2: "0xFFFFu"}.get(w, "0xFFFFFFFFu")
+    cast = {1: "(int8_t)", 2: "(int16_t)"}.get(w, "(int32_t)")
+    m = insn.mnemonic
+    if m in ("cmp", "sub"):
+        a, b = _fmt_operand_read(ops[0]), _fmt_operand_read(ops[1])
+    elif m == "test":
+        a = f"(uint32_t)({_fmt_operand_read(ops[0])}) & (uint32_t)({_fmt_operand_read(ops[1])})"
+        b = "0"
+    else:
+        a, b = _fmt_operand_read(ops[0]), "0"
+    return [f"_ja = (uint32_t)({a}) & {mask}; _jb = (uint32_t)({b}) & {mask};",
+            f"_jas = (int32_t){cast}(_ja); _jbs = (int32_t){cast}(_jb); /* {m}: join snapshot */"]
+
+
+def plan_join_snapshot(join_bb, pred_blocks, states, follow=()):
+    """Join-snapshot plan for a join whose predecessor states do not merge.
+
+    Returns (state, setter_addresses) or None. Every predecessor's state must
+    come from a setter inside that predecessor (JSNAP_EXACT/JSNAP_ZS), and
+    the first flag reader -- in the join block or the blocks in `follow`, the
+    join's single-predecessor fall-through chain -- must be a jcc the mix
+    supports, with nothing touching the flags before it. Setter widths may
+    differ except for js/jns: each setter masks and sign-extends its own pair.
+    """
+    if not states or any(not s or not s[0] for s in states):
+        return None
+    kinds = {s[0] for s in states}
+    if not kinds <= (JSNAP_EXACT | JSNAP_ZS):
+        return None
+    reader = None
+    for insn in [i for b in (join_bb,) + tuple(follow) for i in b.instructions]:
+        m = insn.mnemonic
+        if insn.is_cond_jump:
+            reader = insn
+            break
+        if m == "jmp" or (m in _EFLAGS_PRESERVE and m not in ("popfd", "call", "int", "int3")):
+            continue
+        if (m.startswith("f") and m not in ("fcomi", "fcomip", "fucomi", "fucomip",
+                                              "fcompi", "fucompi")):
+            continue
+        return None
+    if reader is None or reader.mnemonic in ("jecxz", "jcxz"):
+        return None
+    exact = kinds <= JSNAP_EXACT
+    if reader.mnemonic not in (_JSNAP_EXACT_JCC if exact else _JSNAP_ZS_JCC):
+        return None
+    setters, width = [], None
+    for bb, (kind, ops) in zip(pred_blocks, states):
+        need = 1 if kind in ("inc", "dec", "neg") else 2
+        found = None
+        for insn in reversed(bb.instructions):
+            if (insn.mnemonic == kind and len(insn.operands) == len(ops)
+                    and all(x is y for x, y in zip(insn.operands, ops))):
+                found = insn
+                break
+        if found is None or len(ops) < need:
+            return None
+        w = _operand_width(ops[0]) or (_operand_width(ops[1]) if len(ops) > 1 else None)
+        if w is None or (width is not None and w != width
+                         and reader.mnemonic in ("js", "jns")):
+            return None
+        width = w
+        setters.append(found.address)
+    return ("jsnap" if exact else "jsnap_zs", [states[0][1][0]]), setters
+
+
+def _writes_reg_family(insn, reg):
+    """Whether insn writes any part of the 32-bit register holding reg."""
+    def family(r):
+        r = str(r).lower()
+        return _REG_FAMILY.get(r, r)
+    if insn.mnemonic == "push":
+        return family(reg) == "esp"
+    ops = insn.operands
+    return bool(ops) and ops[0].type == "reg" and family(ops[0].reg) == family(reg)
+
+
+def merge_result_flag_states(join_bb, pred_blocks, states):
+    """ZF/SF-only merge of different result-based flag setters at a join.
+
+    MSVC's signed `x % 2^n` is `and r, mask; jns L; dec r; or r, -2^n; inc r;
+    L: je/jne`: the flags at L come from `and` on one edge and `inc` on the
+    other. Both leave ZF/SF describing r, so a ZF/SF consumer can read r. CF/OF
+    differ between such setters and stay unknown. Only accepted when every
+    predecessor's flag setter is its last instruction (before a closing jump)
+    and writes the same register, and the join block reads the flags before
+    anything writes r or the flags (plain moves and stores may come first:
+    Blinx's `add al, -6 / add al, -12; L: mov [esi+0xD], al; jns`), so r still
+    holds the result wherever it is read. The caller must not let this state
+    flow past the join block.
+    """
+    if not states or any(not s or not s[0] for s in states):
+        return None
+    join_insns = join_bb.instructions or []
+    lead = 0
+    while lead < len(join_insns) and join_insns[lead].mnemonic in _RESJOIN_PASSTHROUGH:
+        lead += 1
+    first = join_insns[lead] if lead < len(join_insns) else None
+    if first is None or not (first.is_cond_jump or first.mnemonic.startswith(("set", "cmov"))):
+        return None
+    if first.mnemonic in ("jecxz", "jcxz"):
+        return None
+    dest = None
+    for bb, (kind, ops) in zip(pred_blocks, states):
+        if kind not in RESULT_ZF_SETTERS or not ops or ops[0].type != "reg":
+            return None
+        insns = bb.instructions
+        k = len(insns) - 1
+        if k >= 0 and (insns[k].is_cond_jump or insns[k].mnemonic == "jmp"):
+            k -= 1
+        if (k < 0 or insns[k].mnemonic != kind or not insns[k].operands
+                or insns[k].operands[0].type != "reg"
+                or insns[k].operands[0].reg != ops[0].reg):
+            return None
+        if dest is None:
+            dest = ops[0]
+        elif ops[0].reg != dest.reg:
+            return None
+    if any(_writes_reg_family(insn, dest.reg) for insn in join_insns[:lead]):
+        return None
+    return ("resjoin", [dest])
+
+
 def _make_condition(jcc, flag_setter, flag_ops):
     """
     Generate a C condition expression for a jcc based on what set the flags.
@@ -447,7 +613,14 @@ def _make_condition(jcc, flag_setter, flag_ops):
     # comparison happens. Use those rather than re-reading registers that may
     # since have changed.
     SIGNED = {"CMP_L", "CMP_LE", "CMP_G", "CMP_GE", "TEST_S"}
-    if flag_setter in ("cmp", "test", "bsf", "bsr") and len(flag_ops) >= 2:
+    if flag_setter in ("jsnap", "jsnap_zs"):
+        # A join snapshot reads as `cmp _ja, _jb` (plan_join_snapshot).
+        if jcc not in (_JSNAP_EXACT_JCC if flag_setter == "jsnap" else _JSNAP_ZS_JCC):
+            return None
+        signed = (cmp_macro in SIGNED) or (test_macro in SIGNED)
+        lhs, rhs = ("_jas", "_jbs") if signed else ("_ja", "_jb")
+        flag_setter = "cmp"
+    elif flag_setter in ("cmp", "test", "bsf", "bsr") and len(flag_ops) >= 2:
         signed = (cmp_macro in SIGNED) or (test_macro in SIGNED)
         lhs, rhs = ("_fas", "_fbs") if signed else ("_fa", "_fb")
     elif len(flag_ops) >= 2:
@@ -528,11 +701,27 @@ def _make_condition(jcc, flag_setter, flag_ops):
     # `test dl, dl; jns` asks about bit 7; evaluating the zero-extended byte as
     # an int32 makes 0x80..0xFF look positive and the branch always goes the
     # same way. Same defect the signed compares had before the width-aware
-    # CMP_L/CMP_G landed -- js/jns were simply missed at the time.
+    # CMP_L/CMP_G landed -- js/jns were simply missed at the time. The
+    # result-based setters below read the destination and need it too: Blinx
+    # clamps its player's byte weights with `add byte [esi+0xC], -16; jns`,
+    # and a zero-extended read never went negative, so they wrapped to 0xF0.
     _sf_width = _operand_width(flag_ops[0]) if flag_ops else None
     if _sf_width is None and len(flag_ops) > 1:
         _sf_width = _operand_width(flag_ops[1])
     _sf_cast = {1: "(int8_t)", 2: "(int16_t)"}.get(_sf_width, "(int32_t)")
+    _ucast = {1: "(uint8_t)", 2: "(uint16_t)"}.get(_sf_width, "(uint32_t)")
+
+    # ── join of result-based setters on one register: ZF/SF only ──
+    if flag_setter == "resjoin":
+        if jcc in ("je", "jz"):
+            return f"({lhs} == 0)", desc
+        if jcc in ("jne", "jnz"):
+            return f"({lhs} != 0)", desc
+        if jcc == "js":
+            return f"({_sf_cast}({lhs}) < 0)", desc
+        if jcc == "jns":
+            return f"({_sf_cast}({lhs}) >= 0)", desc
+        return None
 
     # ── bsf/bsr: ZF is the only flag they define ──
     #
@@ -611,24 +800,25 @@ def _make_condition(jcc, flag_setter, flag_ops):
         if jcc in ("jne", "jnz"):
             return f"({lhs} != 0)", desc
         if jcc == "js":
-            return f"((int32_t){lhs} < 0)", desc
+            return f"({_sf_cast}({lhs}) < 0)", desc
         if jcc == "jns":
-            return f"((int32_t){lhs} >= 0)", desc
+            return f"({_sf_cast}({lhs}) >= 0)", desc
         # Ordered: reconstruct original a = result + b
         if cmp_macro and rhs:
-            return f"{cmp_macro}((uint32_t){lhs} + (uint32_t){rhs}, (uint32_t){rhs})", desc
+            return (f"{cmp_macro}({_ucast}((uint32_t){lhs} + (uint32_t){rhs}), "
+                    f"{_ucast}({rhs}))", desc)
         if jcc in ("jb", "jnae"):
             return f"((uint32_t){lhs} + (uint32_t){rhs} < (uint32_t){rhs})", desc
         if jcc in ("jae", "jnb"):
             return f"((uint32_t){lhs} + (uint32_t){rhs} >= (uint32_t){rhs})", desc
         if jcc in ("jl", "jnge"):
-            return f"((int32_t){lhs} < 0)", desc
+            return f"({_sf_cast}({lhs}) < 0)", desc
         if jcc in ("jge", "jnl"):
-            return f"((int32_t){lhs} >= 0)", desc
+            return f"({_sf_cast}({lhs}) >= 0)", desc
         if jcc in ("jle", "jng"):
-            return f"((int32_t){lhs} <= 0)", desc
+            return f"({_sf_cast}({lhs}) <= 0)", desc
         if jcc in ("jg", "jnle"):
-            return f"((int32_t){lhs} > 0)", desc
+            return f"({_sf_cast}({lhs}) > 0)", desc
         return None
 
     # ── add: a = a + b, flags from result ──
@@ -638,21 +828,21 @@ def _make_condition(jcc, flag_setter, flag_ops):
         if jcc in ("jne", "jnz"):
             return f"({lhs} != 0)", desc
         if jcc == "js":
-            return f"((int32_t){lhs} < 0)", desc
+            return f"({_sf_cast}({lhs}) < 0)", desc
         if jcc == "jns":
-            return f"((int32_t){lhs} >= 0)", desc
+            return f"({_sf_cast}({lhs}) >= 0)", desc
         if jcc in ("jb", "jnae", "jc"):
             return f"({lhs} < (uint32_t){rhs})", desc
         if jcc in ("jae", "jnb", "jnc"):
             return f"({lhs} >= (uint32_t){rhs})", desc
         if jcc in ("jl", "jnge"):
-            return f"((int32_t){lhs} < 0)", desc
+            return f"({_sf_cast}({lhs}) < 0)", desc
         if jcc in ("jge", "jnl"):
-            return f"((int32_t){lhs} >= 0)", desc
+            return f"({_sf_cast}({lhs}) >= 0)", desc
         if jcc in ("jle", "jng"):
-            return f"((int32_t){lhs} <= 0)", desc
+            return f"({_sf_cast}({lhs}) <= 0)", desc
         if jcc in ("jg", "jnle"):
-            return f"((int32_t){lhs} > 0)", desc
+            return f"({_sf_cast}({lhs}) > 0)", desc
         return None
 
     # ── adc/sbb: result-based (like add/sub but with carry) ──
@@ -662,9 +852,9 @@ def _make_condition(jcc, flag_setter, flag_ops):
         if jcc in ("jne", "jnz"):
             return f"({lhs} != 0)", desc
         if jcc == "js":
-            return f"((int32_t){lhs} < 0)", desc
+            return f"({_sf_cast}({lhs}) < 0)", desc
         if jcc == "jns":
-            return f"((int32_t){lhs} >= 0)", desc
+            return f"({_sf_cast}({lhs}) >= 0)", desc
         return None
 
     # ── and/or/xor: result-based, CF=0, OF=0 ──
@@ -674,13 +864,13 @@ def _make_condition(jcc, flag_setter, flag_ops):
         if jcc in ("jne", "jnz"):
             return f"({lhs} != 0)", desc
         if jcc in ("js", "jl"):
-            return f"((int32_t){lhs} < 0)", desc
+            return f"({_sf_cast}({lhs}) < 0)", desc
         if jcc in ("jns", "jge"):
-            return f"((int32_t){lhs} >= 0)", desc
+            return f"({_sf_cast}({lhs}) >= 0)", desc
         if jcc == "jle":
-            return f"((int32_t){lhs} <= 0)", desc
+            return f"({_sf_cast}({lhs}) <= 0)", desc
         if jcc == "jg":
-            return f"((int32_t){lhs} > 0)", desc
+            return f"({_sf_cast}({lhs}) > 0)", desc
         if jcc in ("jb", "jnae"):
             return "0", desc  # CF=0 after and/or/xor
         if jcc in ("jae", "jnb"):
@@ -738,17 +928,17 @@ def _make_condition(jcc, flag_setter, flag_ops):
         if jcc in ("jae", "jnb", "jnc"):
             return f"({lhs} == 0)", desc
         if jcc == "js":
-            return f"((int32_t){lhs} < 0)", desc
+            return f"({_sf_cast}({lhs}) < 0)", desc
         if jcc == "jns":
-            return f"((int32_t){lhs} >= 0)", desc
+            return f"({_sf_cast}({lhs}) >= 0)", desc
         if jcc in ("jg", "jnle"):
-            return f"((int32_t){lhs} > 0)", desc
+            return f"({_sf_cast}({lhs}) > 0)", desc
         if jcc in ("jge", "jnl"):
-            return f"((int32_t){lhs} >= 0)", desc
+            return f"({_sf_cast}({lhs}) >= 0)", desc
         if jcc in ("jl", "jnge"):
-            return f"((int32_t){lhs} < 0)", desc
+            return f"({_sf_cast}({lhs}) < 0)", desc
         if jcc in ("jle", "jng"):
-            return f"((int32_t){lhs} <= 0)", desc
+            return f"({_sf_cast}({lhs}) <= 0)", desc
         return None
 
     # ── shift: result-based ──
@@ -758,9 +948,9 @@ def _make_condition(jcc, flag_setter, flag_ops):
         if jcc in ("jne", "jnz"):
             return f"({lhs} != 0)", desc
         if jcc == "js":
-            return f"((int32_t){lhs} < 0)", desc
+            return f"({_sf_cast}({lhs}) < 0)", desc
         if jcc == "jns":
-            return f"((int32_t){lhs} >= 0)", desc
+            return f"({_sf_cast}({lhs}) >= 0)", desc
         return None
 
     # ── shld/shrd: double-precision shift, result-based ──
@@ -770,14 +960,20 @@ def _make_condition(jcc, flag_setter, flag_ops):
         if jcc in ("jne", "jnz"):
             return f"({lhs} != 0)", desc
         if jcc == "js":
-            return f"((int32_t){lhs} < 0)", desc
+            return f"({_sf_cast}({lhs}) < 0)", desc
         if jcc == "jns":
-            return f"((int32_t){lhs} >= 0)", desc
+            return f"({_sf_cast}({lhs}) >= 0)", desc
         return None
 
     # ── rol/ror/rcl/rcr: rotation, only CF/OF affected ──
     if flag_setter in ("rol", "ror", "rcl", "rcr"):
-        # ZF/SF not modified by rotations - can't resolve most conditions
+        # rcl/rcr carry out through _cf (see _lift_rotate_carry); ZF/SF are
+        # not modified by rotations, so nothing else can be resolved.
+        if flag_setter in ("rcl", "rcr"):
+            if jcc in ("jb", "jnae", "jc"):
+                return "_cf", desc
+            if jcc in ("jae", "jnb", "jnc"):
+                return "!_cf", desc
         return None
 
     # ── bsf/bsr: bit scan, ZF set if source is zero ──
@@ -915,10 +1111,29 @@ def try_match_cmp_jcc(insns, idx, lifter=None):
 # rather than asking every project to look them up by hand.
 #
 #   __SEH_prolog   mov eax, fs:[0]        64 A1 00 00 00 00
-#                  lea ebp, [esp+0x10]    8D 6C 24 10
+#                  lea ebp, [esp+N]       8D 6C 24 xx
 #   __SEH_epilog   mov fs:[0], ecx        64 89 0D 00 00 00 00
 #                  leave; push ecx; ret   C9 51 C3
-_SEH_PROLOG_MARKERS = (b"\x64\xa1\x00\x00\x00\x00", b"\x8d\x6c\x24\x10")
+#
+# The prolog is identified by the fs:[0] READ (mov eax, fs:[0]) plus the
+# lea ebp,[esp+N] frame set, with ANY lea displacement. A title can ship more
+# than one prolog VARIANT and they differ in two independent ways, so neither a
+# fixed displacement nor a fixed fs-install opcode is safe to require:
+#   - the lea displacement tracks how many slots were pushed -- Blinx has the
+#     [esp+0x10] form (sub_001276F0) AND the [esp+0x0c] form (sub_0012854C);
+#   - the new handler is installed with either `mov fs:[0], esp` (64 89 25) or
+#     `mov fs:[0], eax` (64 A3) -- sub_0012854C uses the former, sub_001276F0
+#     the latter.
+# The old fixed `8D 6C 24 10` marker matched only sub_001276F0, and detection
+# stopped at the first pair, so sub_0012854C's 63 callers ran with an 8-byte-
+# wrong frame (MEM32(ebp+8) read the prolog's own return address instead of
+# arg0). Match on the fs:[0] read + the lea-ebp-esp opcode (3 bytes,
+# displacement-agnostic) and collect ALL variants: reading the current SEH
+# handler and repointing ebp from esp inside a <=128-byte function is uniquely
+# the _EH_prolog idiom, and the epilog never reads fs:[0] into eax so it is not
+# confused for one.
+_SEH_PROLOG_MARKERS = (b"\x64\xa1\x00\x00\x00\x00",
+                       b"\x8d\x6c\x24")
 _SEH_EPILOG_MARKERS = (b"\x64\x89\x0d\x00\x00\x00\x00", b"\xc9\x51\xc3")
 
 # Both are tiny; a large match is something else that happens to touch fs:[0].
@@ -926,15 +1141,33 @@ _SEH_PROLOG_MAX_SIZE = 128
 _SEH_EPILOG_MAX_SIZE = 64
 
 
-def detect_seh_helpers(func_db, xbe_data, verbose=False):
-    """Locate __SEH_prolog / __SEH_epilog in the target binary.
+def _seh_addr_set(v):
+    """Normalise an SEH-helper spec to a set of addresses.
 
-    Returns (prolog_addr, epilog_addr); either may be None if not found, which
-    is normal for a title whose CRT does not use them.
+    Accepts None (nothing), a single address (a --seh-prolog/--seh-epilog CLI
+    override), or a set/list of addresses (what detect_seh_helpers returns).
+    """
+    if v is None:
+        return set()
+    if isinstance(v, (set, frozenset, list, tuple)):
+        return {a for a in v if a is not None}
+    return {v}
+
+
+def detect_seh_helpers(func_db, xbe_data, verbose=False):
+    """Locate every __SEH_prolog / __SEH_epilog variant in the target binary.
+
+    Returns (prologs, epilogs) as two sets of addresses, each possibly empty
+    (empty is normal for a title whose CRT does not use them). A title can ship
+    more than one variant of each -- Blinx has two prologs (the [esp+0x10] and
+    [esp+0x0c] forms) -- and missing one leaves all of that variant's callers
+    with a wrong frame pointer, so every match is collected rather than the
+    first pair only.
     """
     from .config import va_to_file_offset
 
-    prolog = epilog = None
+    prologs = set()
+    epilogs = set()
 
     def _size_of(info):
         # "end" is a hex string in functions.json but BatchTranslator rewrites
@@ -964,23 +1197,19 @@ def detect_seh_helpers(func_db, xbe_data, verbose=False):
             continue
         body = xbe_data[offset:offset + size]
 
-        if (prolog is None and size <= _SEH_PROLOG_MAX_SIZE
-                and all(m in body for m in _SEH_PROLOG_MARKERS)):
-            prolog = addr
-        elif (epilog is None and size <= _SEH_EPILOG_MAX_SIZE
+        if all(m in body for m in _SEH_PROLOG_MARKERS):
+            prologs.add(addr)
+        elif (size <= _SEH_EPILOG_MAX_SIZE
                 and all(m in body for m in _SEH_EPILOG_MARKERS)):
-            epilog = addr
-
-        if prolog is not None and epilog is not None:
-            break
+            epilogs.add(addr)
 
     if verbose:
         import sys
-        fmt = lambda a: f"0x{a:08X}" if a else "not found"
-        print(f"  SEH helpers: __SEH_prolog {fmt(prolog)}, "
-              f"__SEH_epilog {fmt(epilog)}", file=sys.stderr)
+        fmt = lambda s: ", ".join(f"0x{a:08X}" for a in sorted(s)) if s else "not found"
+        print(f"  SEH helpers: __SEH_prolog {fmt(prologs)}; "
+              f"__SEH_epilog {fmt(epilogs)}", file=sys.stderr)
 
-    return prolog, epilog
+    return prologs, epilogs
 
 
 # MSVC's setjmp/longjmp pair, found by the "VC20" cookie the CRT stamps into
@@ -1057,6 +1286,11 @@ class Lifter:
         self.abi_db = abi_db or {}
         self.xbe_data = xbe_data
         self.manual_functions = set(manual_functions or ())
+        # addr -> public name for functions recomp_manual.c WRAPS (defines
+        # sub_X itself and calls the generated body as sub_X_gen). The body is
+        # emitted under the _gen name, but every call site must name the
+        # wrapper, or direct callers silently bypass it.
+        self.wrapped_functions = {}
         self._fp_top = 0  # FPU stack top index
         self.func_start = 0  # Set per-function by translator
         self.func_end = 0
@@ -1081,10 +1315,18 @@ class Lifter:
         # leave the other unset -- that is the bug this whole path fixes.
         if (seh_prolog is None or seh_epilog is None) and self.func_db:
             found_prolog, found_epilog = detect_seh_helpers(self.func_db, xbe_data)
-            seh_prolog = seh_prolog if seh_prolog is not None else found_prolog
-            seh_epilog = seh_epilog if seh_epilog is not None else found_epilog
-        self.SEH_PROLOG = seh_prolog
-        self.SEH_EPILOG = seh_epilog
+            if seh_prolog is None:
+                seh_prolog = found_prolog
+            if seh_epilog is None:
+                seh_epilog = found_epilog
+        # seh_prolog/seh_epilog may be a set (detected), a single address (a
+        # --seh-prolog/--seh-epilog override) or None; normalise to sets so a
+        # title with several prolog variants is handled by set membership.
+        self.SEH_PROLOGS = _seh_addr_set(seh_prolog)
+        self.SEH_EPILOGS = _seh_addr_set(seh_epilog)
+        # Representative singles kept for any legacy single-value consumer.
+        self.SEH_PROLOG = min(self.SEH_PROLOGS) if self.SEH_PROLOGS else None
+        self.SEH_EPILOG = min(self.SEH_EPILOGS) if self.SEH_EPILOGS else None
         self.SETJMP_FN = setjmp_fn
         self.LONGJMP_FN = longjmp_fn
         self.jump_table_targets = {}
@@ -1102,7 +1344,9 @@ class Lifter:
         function any naming pass had touched. Labels still cover call targets
         that are not known function starts.
         """
-        if addr in self.func_db:
+        if addr in self.wrapped_functions:
+            name = self.wrapped_functions[addr]
+        elif addr in self.func_db:
             name = self.func_db[addr].get("name", f"sub_{addr:08X}")
         elif addr in self.label_db:
             name = self.label_db[addr]
@@ -1171,6 +1415,8 @@ class Lifter:
             return self._lift_sar(insn, ops)
         if m in ("rol", "ror"):
             return self._lift_rotate(insn, ops, m)
+        if m in ("rcl", "rcr"):
+            return self._lift_rotate_carry(insn, ops, m)
 
         # ── Comparison / test (standalone, not part of cmp+jcc pattern) ──
         if m == "cmp":
@@ -1810,6 +2056,31 @@ class Lifter:
         func = "ROL32" if m == "rol" else "ROR32"
         return [_fmt_operand_write(ops[0], f"{func}({dst}, {cnt})")]
 
+    def _lift_rotate_carry(self, insn, ops, m):
+        """RCL/RCR: rotate through carry -- a (w+1)-bit rotation of CF:dst.
+
+        The low halves of 64-bit shifts in the CRT's long divide/multiply
+        helpers (shr hi,1 / rcr lo,1) carry the bit between the halves this
+        way; dropping it made those helpers return wrong results. The count is
+        masked to 5 bits, then taken mod w+1 (only 8/16-bit forms wrap)."""
+        if len(ops) < 2:
+            return [f"/* {m}: bad operands */"]
+        w = (_operand_width(ops[0]) or 4) * 8
+        mask = (1 << w) - 1
+        dst = _fmt_operand_read(ops[0])
+        cnt = _fmt_operand_read(ops[1])
+        if m == "rcr":
+            rot = f"(_v >> _c) | (_v << ({w + 1} - _c))"
+        else:
+            rot = f"(_v << _c) | (_v >> ({w + 1} - _c))"
+        return ["{ unsigned _c = ((unsigned)(%s) & 0x1Fu) %% %du;"
+                " if (_c) { uint64_t _v = ((uint64_t)(_cf & 1) << %d)"
+                " | ((uint64_t)(%s) & 0x%Xu); _v = (%s) & 0x%XULL;"
+                " _cf = (int)((_v >> %d) & 1); %s } }  /* %s */"
+                % (cnt, w + 1, w, dst, mask, rot, (1 << (w + 1)) - 1, w,
+                   _fmt_operand_write(ops[0], "(uint32_t)(_v & 0x%Xu)" % mask),
+                   m)]
+
     # ── Compare / Test (standalone) ──
 
     # Sign-extending cast and mask per operand width, shared by the flag
@@ -1906,6 +2177,8 @@ class Lifter:
     # callers that construct a Lifter without a function database.
     SEH_PROLOG = None
     SEH_EPILOG = None
+    SEH_PROLOGS = frozenset()
+    SEH_EPILOGS = frozenset()
 
     # The CRT's setjmp/longjmp, detected by detect_setjmp_helpers().
     SETJMP_FN = None
@@ -2008,7 +2281,8 @@ class Lifter:
             # stack address where the caller had just zeroed it, so an
             # "if (status < 0)" test against esi failed and XapiInitProcess
             # bailed to the dashboard.
-            if insn.call_target in (self.SEH_PROLOG, self.SEH_EPILOG):
+            if (insn.call_target in self.SEH_PROLOGS
+                    or insn.call_target in self.SEH_EPILOGS):
                 lines.insert(0, "g_seh_ebp = ebp; /* publish frame to SEH helper */")
                 lines.append("ebp = g_seh_ebp; /* read back frame from SEH helper */")
             return lines
@@ -2034,7 +2308,8 @@ class Lifter:
         # If this function IS __SEH_prolog or __SEH_epilog, bridge ebp
         # so the caller can read back the frame pointer.
         prefix = ""
-        if self.func_start in (self.SEH_PROLOG, self.SEH_EPILOG):
+        if (self.func_start in self.SEH_PROLOGS
+                or self.func_start in self.SEH_EPILOGS):
             prefix = "g_seh_ebp = ebp; "
         # Exit trace, for functions that return with a register the caller
         # relied on holding something else. Entry tracing alone cannot show
@@ -3229,7 +3504,7 @@ class Lifter:
         return [f"/* FPU: {m} {insn.op_str} */"]
 
 
-def lift_basic_block(lifter, bb, flag_state=None):
+def lift_basic_block(lifter, bb, flag_state=None, jsnap_at=None):
     """
     Lift a basic block to C statements.
     Tracks flags to generate proper conditions for jcc/setcc/cmovcc.
@@ -3239,6 +3514,8 @@ def lift_basic_block(lifter, bb, flag_state=None):
         bb: BasicBlock with instructions
         flag_state: tuple of (flag_setter_mnemonic, flag_operands) from
                     a preceding block, or None
+        jsnap_at: addresses of flag setters that also write the join
+                  snapshot _ja/_jb (plan_join_snapshot), or None
 
     Returns:
         (stmts, flag_state) where stmts is a list of C statement strings
@@ -3270,6 +3547,8 @@ def lift_basic_block(lifter, bb, flag_state=None):
             if flag_insn.mnemonic in ("cmp", "test") and len(flag_insn.operands) >= 2:
                 stmts.extend(lifter._snapshot_flags(
                     flag_insn, flag_insn.operands, flag_insn.mnemonic))
+            if jsnap_at and flag_insn.address in jsnap_at:
+                stmts.extend(_jsnap_stmts(flag_insn))
             stmts.append(stmt)
             last_flag_setter = flag_insn.mnemonic
             last_flag_ops = list(flag_insn.operands)
@@ -3325,13 +3604,21 @@ def lift_basic_block(lifter, bb, flag_state=None):
                 i += 1
                 continue
 
+        snap = jsnap_at and curr.address in jsnap_at
+        if snap and curr.mnemonic == "sub":
+            stmts.extend(_jsnap_stmts(curr))       # sub's pair is its operands
+
         # NEG sets CF when its operand is nonzero. Preserve that value when
         # a later SBB/ADC consumes it, skipping over EFLAGS-preserving
-        # instructions (e.g. neg eax; push edi; sbb eax, eax).
+        # instructions (e.g. neg eax; push edi; sbb eax, eax). x87 arithmetic
+        # leaves EFLAGS alone too: MSVC schedules fild/fmul/fstp between the
+        # pair (monster draw 0x13600: neg bl; ...; fild; fmul; sbb ebx, ebx),
+        # and stopping there dropped the carry, so sbb read a stale _cf.
         if curr.mnemonic == "neg":
             j = i + 1
             while (j < len(insns)
-                    and insns[j].mnemonic in _EFLAGS_PRESERVE
+                    and (insns[j].mnemonic in _EFLAGS_PRESERVE
+                         or _x87_keeps_eflags(insns[j].mnemonic))
                     and insns[j].mnemonic != "popfd"
                     and not insns[j].is_branch
                     and not insns[j].is_call
@@ -3344,6 +3631,8 @@ def lift_basic_block(lifter, bb, flag_state=None):
         else:
             results = lifter.lift_instruction(insns[i])
         stmts.extend(results)
+        if snap and curr.mnemonic != "sub":
+            stmts.extend(_jsnap_stmts(curr))       # the result, at its width
 
         # Track flag-setting instructions
         if curr.mnemonic in FLAG_SETTERS:
